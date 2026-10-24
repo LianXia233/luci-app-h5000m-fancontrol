@@ -6,6 +6,8 @@ POLICY_FILE="/var/run/h5000m-fancontrol.policy"
 LOCK_DIR="/var/lock/h5000m-fancontrol.lock"
 MT5700M_TEMP_CACHE="${H5000M_FAN_MT5700M_TEMP_CACHE:-/var/run/mt5700m/temperature}"
 MT5700M_TEMP_MAX_AGE="${H5000M_FAN_MT5700M_TEMP_MAX_AGE:-60}"
+SENSOR_SYSFS_ROOT="${H5000M_FAN_SENSOR_SYSFS_ROOT:-/sys}"
+RADIO_SYSFS_ROOT="${H5000M_FAN_RADIO_SYSFS_ROOT:-/sys/class/net}"
 
 is_uint() {
 	case "$1" in
@@ -194,6 +196,21 @@ max_sensor() {
 	fi
 }
 
+read_vendor_radio_temp() {
+	local iface="$1" output
+	command -v iwpriv >/dev/null 2>&1 || return 1
+	# Do not add an unbounded driver ioctl to the safety controller loop.
+	command -v timeout >/dev/null 2>&1 || return 1
+	[ -d "$RADIO_SYSFS_ROOT/$iface" ] || return 1
+	output="$(timeout 1 iwpriv "$iface" stat 2>/dev/null)" || return 1
+	printf '%s\n' "$output" | awk '
+		/CurrentTemperature[[:space:]]*=/ {
+			split($0,a,"="); gsub(/^[[:space:]]+|[[:space:]]+$/, "", a[2])
+			if (a[2] ~ /^[0-9]+$/ && a[2]+0 <= 125) print a[2]+0
+			exit
+		}'
+}
+
 read_sensors() {
 	local zone type value hwmon name
 	CPU_TEMP=""; CPU_LABEL=""; PHY_TEMP=""; PHY_LABEL=""
@@ -201,7 +218,7 @@ read_sensors() {
 	MODULE_TEMP="$(find_module_temp 2>/dev/null || true)"
 	CONTROL_TEMP=""; CONTROL_SENSOR=""
 
-	for zone in /sys/class/thermal/thermal_zone*; do
+	for zone in "$SENSOR_SYSFS_ROOT"/class/thermal/thermal_zone*; do
 		[ -e "$zone/temp" ] || continue
 		type="$(cat "$zone/type" 2>/dev/null || true)"
 		value="$(read_temp_c "$zone/temp" 2>/dev/null || true)"
@@ -213,7 +230,7 @@ read_sensors() {
 		esac
 	done
 
-	for hwmon in /sys/class/hwmon/hwmon*; do
+	for hwmon in "$SENSOR_SYSFS_ROOT"/class/hwmon/hwmon*; do
 		[ -d "$hwmon" ] || continue
 		name="$(cat "$hwmon/name" 2>/dev/null || true)"
 		value="$(read_temp_c "$hwmon/temp1_input" 2>/dev/null || true)"
@@ -234,6 +251,17 @@ read_sensors() {
 				;;
 		esac
 	done
+
+	# Vendor mt_wifi drivers may expose radio temperature only via iwpriv.
+	# Keep native hwmon readings authoritative; missing/invalid is not zero.
+	if [ -z "$WIFI1_TEMP" ]; then
+		WIFI1_TEMP="$(read_vendor_radio_temp ra0 2>/dev/null || true)"
+		[ -z "$WIFI1_TEMP" ] || WIFI1_LABEL='MTK radio ra0'
+	fi
+	if [ -z "$WIFI2_TEMP" ]; then
+		WIFI2_TEMP="$(read_vendor_radio_temp rai0 2>/dev/null || true)"
+		[ -z "$WIFI2_TEMP" ] || WIFI2_LABEL='MTK radio rai0'
+	fi
 
 	max_sensor "$CPU_TEMP" "${CPU_LABEL:-CPU}"
 	if [ "$TEMP_SOURCE" = "max" ]; then

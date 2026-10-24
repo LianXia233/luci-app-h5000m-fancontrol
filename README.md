@@ -9,7 +9,15 @@
 > H5000M fan manager for OpenWrt with temperature-aware profiles, manual PWM control, hysteresis, delayed spin-down, start boost and sensor failsafe protection.
 
 版本采用标准的 `主版本.次版本.修订版本-r打包修订` 格式。GitHub Release 仅使用
-语义版本标签（当前为 `v2.1.0`），OpenWrt 安装包版本为 `2.1.0-r1`。
+语义版本标签（当前为 `v2.1.1`），OpenWrt 安装包版本为 `2.1.1-r1`。
+
+## 2.1.1 更新
+
+- 支持 MTK 厂商 Wi-Fi 驱动的温度回退读取（#2）：优先使用原有 thermal/hwmon；只有对应读数缺失、接口存在且可用时，才通过 `iwpriv ra0/rai0 stat` 读取 `CurrentTemperature`。
+- 每个回退查询最多 1 秒，只接受 0–125°C 的整数；命令失败、超时或格式错误保留“无读数”，不当成 0°C。不安装或调用任何无线配置命令。
+- `iwpriv` 和 `timeout` 为可选能力，缺失时跳过回退；`max` 模式仍取所有有效传感器最高温度，原内核温控保护和安全下限不变。
+- 增加厂商温度、异常值/超时、原生传感器优先与温控保护回归测试；发布构建先通过 CI。真实厂商驱动环境仍需安装者复测反馈，不能将模拟测试当作全平台实机认证。
+- APK 发布前显式签名并严格验签，同时提供 SDK 校验值、源码提交和包 SHA256；仅发布构建公钥，不发布私钥。
 
 ![散热管理界面](docs/fan-control-ui.jpg)
 

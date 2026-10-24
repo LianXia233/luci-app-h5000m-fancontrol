@@ -10,7 +10,10 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
   build:
+    needs: validate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

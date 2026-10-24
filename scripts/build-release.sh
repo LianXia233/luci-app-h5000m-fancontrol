@@ -42,5 +42,16 @@ make package/h5000m-custom/luci-app-h5000m-fancontrol/compile -j"$(nproc)" V=s
 
 find bin -type f \( -name 'luci-app-h5000m-fancontrol-*.apk' -o -name 'luci-app-h5000m-fancontrol_*.ipk' -o -name 'luci-i18n-h5000m-fancontrol-zh-cn-*.apk' -o -name 'luci-i18n-h5000m-fancontrol-zh-cn_*.ipk' \) -exec cp -f {} "${output_dir}/" \;
 test "$(find "${output_dir}" -type f \( -name '*.apk' -o -name '*.ipk' \) | wc -l)" -ge 2
-cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
-(cd "${output_dir}" && find . -maxdepth 1 -type f \( -name '*.apk' -o -name '*.ipk' -o -name 'openwrt-sdk-build.pem' \) -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+if find "${output_dir}" -name '*.apk' | grep -q .; then
+  cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
+  mkdir -p "${work_dir}/verification-keys"
+  cp public-key.pem "${work_dir}/verification-keys/build.pem"
+  for package in "${output_dir}"/*.apk; do
+    # Only our freshly built package is accepted unsigned at the signing step.
+    staging_dir/host/bin/apk adbsign --allow-untrusted --sign-key private-key.pem "$package"
+    staging_dir/host/bin/apk --keys-dir "${work_dir}/verification-keys" verify "$package"
+  done
+fi
+printf 'SDK=snapshot\nSOURCE_COMMIT=%s\nTARGET=mediatek/filogic\n' "$(git -C "$repo_dir" rev-parse HEAD)" > "${output_dir}/BUILD-INFO.txt"
+grep "[ *]${archive}$" "${work_dir}/sha256sums" >> "${output_dir}/BUILD-INFO.txt"
+(cd "${output_dir}" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)

@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
   pull_request:
 
@@ -23,6 +24,8 @@ jobs:
           sh -n root/etc/uci-defaults/91-h5000m-fancontrol-v2
           sh -n scripts/build-release.sh
           sh tests/test-module-temperature.sh
+          sh tests/test-vendor-temperature.sh
+          sh tests/test-thermal-policy-safety.sh
 
       - name: Check LuCI JavaScript syntax
         run: node --check htdocs/luci-static/resources/view/h5000m/fancontrol.js
