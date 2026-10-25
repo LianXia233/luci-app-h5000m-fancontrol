@@ -1,0 +1,15 @@
+# Static musl builds for every supported OpenWrt architecture. rust-lld ships
+# with the Rust toolchain, so cross compiling a pure-Rust crate needs no foreign
+# gcc; the musl target links fully static and self-contained by default.
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.i686-unknown-linux-musl]
+linker = "rust-lld"

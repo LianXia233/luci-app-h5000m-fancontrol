@@ -1,2 +1,5 @@
 #!/bin/sh
-exec /usr/sbin/h5000m-fancontrol status
+# Structured (JSON) status interface for the LuCI frontend. The JSON model
+# is produced by the Rust controller; external scripts that prefer the
+# historical key=value output can call `h5000m-fancontrol status` directly.
+exec /usr/sbin/h5000m-fancontrol status --json

@@ -8,3 +8,6 @@
 /build/
 /dist/
 /dist-release/
+
+# Rust build artifacts
+src/target/

@@ -1,0 +1,26 @@
+[package]
+name = "h5000m-fancontrol"
+version = "3.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Hiveton H5000M fan controller with thermal safety floors"
+license = "Apache-2.0"
+
+[lib]
+name = "h5000m_fancontrol"
+path = "src/lib.rs"
+
+[[bin]]
+name = "h5000m-fancontrol"
+path = "src/main.rs"
+
+# Intentionally dependency-free: the controller runs as a long-lived daemon on
+# a router and must stay small, auditable and easy to cross-compile with musl.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
