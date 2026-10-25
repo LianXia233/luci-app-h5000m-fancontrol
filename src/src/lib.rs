@@ -15,6 +15,7 @@ pub mod fan;
 pub mod json;
 pub mod lock;
 pub mod logging;
+pub mod modem;
 pub mod paths;
 pub mod platform;
 pub mod report;

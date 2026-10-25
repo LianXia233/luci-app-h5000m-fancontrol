@@ -82,7 +82,14 @@ LuCI 页面 ── fs.exec("h5000m-fancontrol-status json") ── report::build
 | `H5000M_FAN_PROC_ROOT` | `/proc` | 进程存活判断 |
 | `H5000M_FAN_MT5700M_TEMP_CACHE` | `/var/run/mt5700m/temperature` | 模组温度缓存 |
 | `H5000M_FAN_MT5700M_TEMP_MAX_AGE` | `60` | 缓存新鲜度上限（秒） |
+| `H5000M_FAN_MT5700M_RPC_PORT` | `8765` | mt5700 管理器 RPC 端口，0 关闭桥接 |
 | `H5000M_FAN_LEGACY_CACHE_DIR` | `/tmp` | 旧版 QModem 缓存扫描目录 |
 | `H5000M_FAN_SYSLOG_SOCKET` | `/dev/log` | syslog 套接字 |
 
 前四个变量名与 2.x 完全一致，已有的传感器测试脚本无需改名即可复用。
+
+模组温度的来源：守护进程每 30 秒至多一次向本机 `luci-app-mt5700` 管理器的 RPC
+端口（`127.0.0.1:$H5000M_FAN_MT5700M_RPC_PORT`，行协议 `{id,method:"at",params:{cmd}}`）
+发送 `AT^CHIPTEMP?`，把 12 路结温中有效读数的最高值原子写入
+`$H5000M_FAN_MT5700M_TEMP_CACHE`；串口仍由管理器独占，管理器缺席时模组传感器
+照常报告缺失，缓存文件 60 秒新鲜度沿用。

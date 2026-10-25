@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::events::{self, Event, Level, Throttle};
 use crate::lock::{Acquisition, Lock};
 use crate::logging;
+use crate::modem;
 use crate::paths::Paths;
 use crate::platform::{self, Signals};
 use crate::safety;
@@ -250,6 +251,7 @@ pub fn run(paths: &Paths, signals: &Signals) -> ControlResult {
     let mut config_stamp = FileStamp::default();
     let mut wake_stamp: Option<SystemTime> = None;
     let mut tracker = CycleTracker::new();
+    let mut modem_cache = modem::Refresher::default();
 
     if let Err(err) = std::fs::create_dir_all(&paths.run_dir) {
         eprintln!(
@@ -296,6 +298,9 @@ pub fn run(paths: &Paths, signals: &Signals) -> ControlResult {
             break;
         }
         let now = platform::wall_now();
+        // Refresh the bridged modem temperature first: it is throttled to one
+        // query per window and the cycle below reads whatever is cached.
+        modem_cache.refresh(paths, now);
         let previous = Snapshot::read(paths);
         let settings = Settings::load(paths).unwrap_or_default();
         tracker.note_settings(paths, &settings);

@@ -54,6 +54,10 @@ pub struct Paths {
     pub module_cache_max_age: u64,
     /// Directory scanned for the legacy QModem style cache files.
     pub legacy_cache_dir: PathBuf,
+    /// TCP port of the local at-webserver (mt5700) RPC bridge the module
+    /// temperature is bridged from. 0 disables the bridge, which the
+    /// sandboxed tests rely on.
+    pub mt5700_rpc_port: u16,
     /// Log socket used for syslog (`/dev/log`).
     pub syslog_socket: PathBuf,
 }
@@ -72,6 +76,13 @@ fn uint_from_env(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn port_from_env(key: &str, default: u16) -> u16 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(default)
+}
+
 impl Default for Paths {
     fn default() -> Self {
         Paths {
@@ -85,6 +96,7 @@ impl Default for Paths {
             module_cache: PathBuf::from("/var/run/mt5700m/temperature"),
             module_cache_max_age: 60,
             legacy_cache_dir: PathBuf::from("/tmp"),
+            mt5700_rpc_port: port_from_env("H5000M_FAN_MT5700M_RPC_PORT", 8765),
             syslog_socket: PathBuf::from("/dev/log"),
         }
     }
@@ -106,6 +118,7 @@ impl Paths {
             ),
             module_cache_max_age: uint_from_env("H5000M_FAN_MT5700M_TEMP_MAX_AGE", 60),
             legacy_cache_dir: from_env("H5000M_FAN_LEGACY_CACHE_DIR", "/tmp"),
+            mt5700_rpc_port: port_from_env("H5000M_FAN_MT5700M_RPC_PORT", 8765),
             syslog_socket: from_env("H5000M_FAN_SYSLOG_SOCKET", "/dev/log"),
         }
     }
@@ -125,6 +138,7 @@ impl Paths {
             module_cache: root.join("var/run/mt5700m/temperature"),
             module_cache_max_age: 60,
             legacy_cache_dir: root.join("tmp"),
+            mt5700_rpc_port: 0,
             syslog_socket: root.join("dev/log"),
         }
     }

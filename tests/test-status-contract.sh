@@ -51,6 +51,9 @@ export H5000M_FAN_RUN_DIR="${TMP}/var/run"
 export H5000M_FAN_LOCK_DIR="${TMP}/var/lock/h5000m-fancontrol.lock"
 export H5000M_FAN_PROC_ROOT="${TMP}/proc"
 export H5000M_FAN_MT5700M_TEMP_CACHE="${TMP}/var/run/mt5700m/temperature"
+# The contract tests run without the mt5700 manager: keep the bridge off so the
+# controller never dials a real loopback service while testing.
+export H5000M_FAN_MT5700M_RPC_PORT=0
 
 VIEW='htdocs/luci-static/resources/view/h5000m/fancontrol.js'
 [ -f "${VIEW}" ] || fail 'the LuCI view is missing'
