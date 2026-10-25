@@ -76,4 +76,6 @@ if find "${output_dir}" -name '*.apk' | grep -q .; then
 fi
 printf 'SDK=snapshot\nSOURCE_COMMIT=%s\nTARGET=mediatek/filogic\n' "$(git -C "$repo_dir" rev-parse HEAD)" > "${output_dir}/BUILD-INFO.txt"
 grep "[ *]${archive}$" "${work_dir}/sha256sums" >> "${output_dir}/BUILD-INFO.txt"
-(cd "${output_dir}" && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+# Checksums last: stage through a temp file so the SHA256SUMS entry never
+# lists itself and no pipeline reads and writes the same file.
+(cd "${output_dir}" && find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.tmp' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
