@@ -1,5 +1,5 @@
 config settings 'settings'
-	option schema_version '2'
+	option schema_version '3'
 	option enabled '1'
 	option mode 'auto'
 	option curve 'balanced'

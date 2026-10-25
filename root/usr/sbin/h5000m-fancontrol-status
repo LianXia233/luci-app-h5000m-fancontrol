@@ -1,5 +1,8 @@
 #!/bin/sh
-# Structured (JSON) status interface for the LuCI frontend. The JSON model
-# is produced by the Rust controller; external scripts that prefer the
-# historical key=value output can call `h5000m-fancontrol status` directly.
-exec /usr/sbin/h5000m-fancontrol status --json
+# Status interface kept for the rpcd ACL and for operators.
+#
+# `h5000m-fancontrol-status` with no argument reproduces the historical
+# key=value output, so existing shell scripts keep working; the LuCI view calls
+# it with `json` to get the typed contract documented in docs/status-api.md.
+# The Rust controller does the work, this wrapper only fixes the path.
+exec /usr/sbin/h5000m-fancontrol status "$@"

@@ -8,6 +8,5 @@
 /build/
 /dist/
 /dist-release/
-
-# Rust build artifacts
+root/usr/sbin/h5000m-fancontrol
 src/target/
