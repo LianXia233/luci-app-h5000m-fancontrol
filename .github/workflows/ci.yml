@@ -8,24 +8,46 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  static-checks:
-    runs-on: ubuntu-latest
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y gettext
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+          components: clippy, rustfmt
 
-      - name: Check shell syntax
+      - name: Format check
+        working-directory: src
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src
+        run: cargo clippy --lib --tests -- -D warnings
+
+      - name: Unit tests
+        working-directory: src
+        run: cargo test --release
+
+      - name: Cross-compile for aarch64 musl
+        working-directory: src
         run: |
-          sh -n root/usr/sbin/h5000m-fancontrol
-          sh -n root/etc/init.d/h5000m-fancontrol
-          sh -n root/etc/uci-defaults/91-h5000m-fancontrol-v2
-          sh -n scripts/build-release.sh
-          sh tests/test-module-temperature.sh
-          sh tests/test-vendor-temperature.sh
-          sh tests/test-thermal-policy-safety.sh
+          cargo build --release --offline --target aarch64-unknown-linux-musl
+          file target/aarch64-unknown-linux-musl/release/h5000m-fancontrol | grep -q 'aarch64'
+          test "$(stat -c %s target/aarch64-unknown-linux-musl/release/h5000m-fancontrol)" -lt 2097152
+
+  frontend:
+    name: LuCI frontend checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Check LuCI JavaScript syntax
         run: node --check htdocs/luci-static/resources/view/h5000m/fancontrol.js
@@ -36,7 +58,69 @@ jobs:
           jq empty root/usr/share/rpcd/acl.d/luci-app-h5000m-fancontrol.json
 
       - name: Validate translations
-        run: msgfmt --check --check-format -o /dev/null po/zh_Hans/h5000m-fancontrol.po
+        run: |
+          msgfmt --check --check-format -o /dev/null po/zh_Hans/h5000m-fancontrol.po
+          node scripts/check-po.js po/zh_Hans/h5000m-fancontrol.po
+          # Every _() string in the view must exist in the .po catalogue.
+          node scripts/extract-strings.js htdocs/luci-static/resources/view/h5000m/fancontrol.js /tmp/h5fc-strings.txt
+          while IFS= read -r line; do
+            grep -qF "msgid \"${line//\"/\\\"}\"" po/zh_Hans/h5000m-fancontrol.po || {
+              echo "missing translation for: $line" >&2
+              exit 1
+            }
+          done < /tmp/h5fc-strings.txt
 
       - name: Check patch format
         run: git apply --numstat openwrt-patches/h5000m-userspace-fan-control.patch
+
+  packaging:
+    name: Packaging checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck remaining shell scripts
+        run: |
+          shellcheck root/usr/sbin/h5000m-fancontrol-status
+          shellcheck root/etc/init.d/h5000m-fancontrol
+          shellcheck root/etc/uci-defaults/91-h5000m-fancontrol-v3
+          shellcheck scripts/build-release.sh
+
+      - name: No secrets in the repository
+        run: |
+          ! grep -rIl 'BEGIN .*PRIVATE KEY' --exclude-dir=.git .
+          test ! -e private-key.pem
+
+      - name: Controller binary sources
+        run: |
+          # The Rust crate must be the only source of the controller binary.
+          grep -q 'rust' src/Makefile
+          test -f src/Cargo.toml
+          test -f src/Cargo.lock
+
+  regression:
+    name: Regression tests (simulated sysfs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build controller for the test host
+        working-directory: src
+        run: cargo build --release --offline --target x86_64-unknown-linux-musl
+
+      - name: Run regression suite
+        env:
+          H5000M_TEST_BIN: ${{ github.workspace }}/src/target/x86_64-unknown-linux-musl/release/h5000m-fancontrol
+        run: |
+          for t in tests/test-*.sh; do
+            echo "== $t"
+            sh "$t"
+          done
