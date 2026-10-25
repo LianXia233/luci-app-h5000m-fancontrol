@@ -63,18 +63,16 @@ test "$(find "${output_dir}" -type f \( -name '*.apk' -o -name '*.ipk' \) | wc -
 app_apk="$(find "${output_dir}" -type f -name 'luci-app-h5000m-fancontrol-*.apk' | head -n 1)"
 app_ipk="$(find "${output_dir}" -type f -name 'luci-app-h5000m-fancontrol_*.ipk' | head -n 1)"
 if [ -n "${app_apk}" ]; then
-  # An APKv2 file is three concatenated gzipped tar streams (signature, control,
-  # data); without --ignore-zeros tar stops at the first end-of-archive marker
-  # and only ever sees the signature segment.
-  binary_info="$(tar -tzif "${app_apk}" | grep -m1 'usr/sbin/h5000m-fancontrol$' || true)"
-  test -n "${binary_info}" || { echo 'controller binary missing from apk' >&2; exit 1; }
-  tar -xzif "${app_apk}" -O "${binary_info}" > "${output_dir}/.controller.check"
-  file "${output_dir}/.controller.check" | grep -Eq 'ELF 64-bit.*aarch64.*statically linked' || {
-    echo 'packaged controller is not a statically linked aarch64 ELF' >&2
-    file "${output_dir}/.controller.check" >&2
-    exit 1
-  }
-  rm -f "${output_dir}/.controller.check"
+  # The SDK ships apk-tools 3, whose packages are ADB containers that tar
+  # cannot look into; unpack the payload with the SDK's own apk tool.
+  rm -rf "${work_dir}/pkgcheck"
+  mkdir -p "${work_dir}/pkgcheck"
+  staging_dir/host/bin/apk --allow-untrusted extract --destination "${work_dir}/pkgcheck" "${app_apk}"
+  test -f "${work_dir}/pkgcheck/usr/sbin/h5000m-fancontrol" \
+	|| { echo 'controller binary missing from apk' >&2; exit 1; }
+  file "${work_dir}/pkgcheck/usr/sbin/h5000m-fancontrol" | grep -Eq 'ELF 64-bit.*aarch64.*statically linked' \
+	|| { echo 'packaged controller is not a statically linked aarch64 ELF' >&2; exit 1; }
+  rm -rf "${work_dir}/pkgcheck"
 elif [ -n "${app_ipk}" ]; then
   # IPK is an ar archive of two tar streams; the control/data pair.
   rm -rf "${output_dir}/.ipk"
