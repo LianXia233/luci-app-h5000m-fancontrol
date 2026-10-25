@@ -5,1617 +5,2285 @@
 'require poll';
 'require ui';
 
-/* H5000M fan control UI.
+/*
+ * H5000M cooling management.
  *
- * Tabs: overview / control / curve / monitor / settings / diagnostics.
- * Status comes from the Rust controller as JSON (/usr/sbin/h5000m-fancontrol-status
- * wraps `h5000m-fancontrol status --json`); the daemon refreshes a snapshot
- * every control interval so web polling does not re-query sensors itself.
- * Configuration is edited through LuCI's uci API; Save & Apply commits the
- * config, and one bounded `apply` run makes the change effective immediately
- * (the daemon also reloads UCI every cycle and on SIGHUP).
+ * Live numbers come only from `/usr/sbin/h5000m-fancontrol-status json`, the
+ * machine readable contract documented in docs/status-api.md. Configuration is
+ * edited through LuCI's uci API, so Save & Apply commits one transaction and
+ * the running controller picks it up without a service restart.
+ *
+ * Nothing here estimates a value the hardware cannot produce: an unread
+ * temperature stays "unknown", and RPM is rendered only when the board exposes
+ * a tachometer. The fan animation reflects the applied output, never a
+ * measured shaft speed.
  */
 
-var CSS = [
-	'.h5fc{--h5fc-ok:#36c98f;--h5fc-blue:#55a8ff;--h5fc-amber:#f0aa46;--h5fc-red:#ef6262;--h5fc-violet:#9d7bff;color:var(--text-color-high,#222)}',
-	'.h5fc h2{margin:0 0 4px;font-size:21px;line-height:1.3}',
-	'.h5fc-sub{margin:0 0 14px;color:var(--text-color-medium,#666);font-size:13px}',
-	/* header + health chip */
-	'.h5fc-hero{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:2px 2px 13px;margin:0 0 14px;border-bottom:1px solid var(--border-color-low,#e8e8e8)}',
-	'.h5fc-health{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--background-color-high,#f5f5f5);color:var(--h5fc-ok)}',
-	'.h5fc-health:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}',
-	'.h5fc-health.warn{color:var(--h5fc-amber)}.h5fc-health.fail{color:var(--h5fc-red)}.h5fc-health.unknown{color:var(--text-color-medium,#888)}',
-	/* tab strip */
-	'.h5fc-tabs{display:flex;gap:4px;margin:0 0 16px;padding:4px;border:1px solid var(--border-color-low,#e8e8e8);border-radius:12px;background:var(--background-color-high,#fff);overflow-x:auto;scrollbar-width:thin}',
-	'.h5fc-tab{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border:0;border-radius:9px;background:transparent;color:var(--text-color-medium,#666);font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap}',
-	'.h5fc-tab:hover{background:rgba(127,127,127,.08)}',
-	'.h5fc-tab[aria-selected="true"]{background:linear-gradient(160deg,rgba(54,201,143,.16),rgba(54,201,143,.06));color:var(--h5fc-ok);box-shadow:inset 0 0 0 1px rgba(54,201,143,.35)}',
-	'.h5fc-tab .h5fc-dot{width:6px;height:6px;border-radius:50%;background:var(--h5fc-amber);display:none}',
-	'.h5fc-tab[data-dirty="1"] .h5fc-dot{display:inline-block}',
-	/* cards + grids */
-	'.h5fc-grid{display:grid;gap:12px;margin-bottom:16px}',
-	'.h5fc-grid.c4{grid-template-columns:repeat(4,minmax(150px,1fr))}',
-	'.h5fc-grid.c2{grid-template-columns:repeat(2,minmax(200px,1fr))}',
-	'.h5fc-grid.c3{grid-template-columns:repeat(3,minmax(160px,1fr))}',
-	'.h5fc-card{position:relative;overflow:hidden;padding:14px;border:1px solid var(--border-color-medium,#d8d8d8);border-radius:12px;background:var(--background-color-high,#fff)}',
-	'.h5fc-card.accent{border-color:rgba(54,201,143,.45);background:linear-gradient(160deg,rgba(54,201,143,.12),rgba(54,201,143,.03))}',
-	'.h5fc-card-title{font-size:12px;font-weight:600;color:var(--text-color-medium,#666);margin-bottom:8px}',
-	'.h5fc-big{font-size:22px;font-weight:680;line-height:1.2}',
-	'.h5fc-hint{font-size:11px;color:var(--text-color-low,#888);margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-	'.h5fc-panel{margin:0 0 16px;padding:16px;border:1px solid var(--border-color-medium,#d8d8d8);border-radius:14px;background:var(--background-color-high,#fff)}',
-	'.h5fc-panel>h3{margin:0 0 12px;font-size:15px}',
-	'.h5fc-panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}',
-	'.h5fc-panel-head>h3{margin:0}',
-	'.h5fc-badge{padding:4px 9px;border-radius:7px;background:rgba(85,168,255,.13);color:var(--h5fc-blue);font-size:11px;font-weight:600;white-space:nowrap}',
-	'.h5fc-badge.warn{background:rgba(240,170,70,.14);color:var(--h5fc-amber)}',
-	'.h5fc-badge.fail{background:rgba(239,98,98,.14);color:var(--h5fc-red)}',
-	'.h5fc-badge.ok{background:rgba(54,201,143,.14);color:var(--h5fc-ok)}',
-	'.h5fc-badge.mute{background:rgba(127,127,127,.1);color:var(--text-color-medium,#666)}',
-	/* chips row */
-	'.h5fc-chips{display:flex;flex-wrap:wrap;gap:8px}',
-	'.h5fc-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:8px;border:1px solid var(--border-color-low,#e0e0e0);background:rgba(127,127,127,.05);font-size:12px;color:var(--text-color-high,#333)}',
-	'.h5fc-chip b{font-weight:650}',
-	'.h5fc-note{margin-top:12px;padding:10px 12px;border-left:3px solid var(--h5fc-blue);background:rgba(85,168,255,.08);color:var(--text-color-medium,#555);font-size:12px;line-height:1.5;border-radius:0 8px 8px 0}',
-	'.h5fc-note.warn{border-left-color:var(--h5fc-amber);background:rgba(240,170,70,.1)}',
-	'.h5fc-note.fail{border-left-color:var(--h5fc-red);background:rgba(239,98,98,.1)}',
-	/* controls */
-	'.h5fc-field{display:grid;gap:6px;padding:12px;border:1px solid var(--border-color-low,#e4e4e4);border-radius:10px;background:rgba(127,127,127,.03)}',
-	'.h5fc-label{font-size:13px;font-weight:600}',
-	'.h5fc-label small{display:block;font-weight:400;color:var(--text-color-medium,#777);font-size:11px;margin-top:2px;line-height:1.45}',
-	'.h5fc-input,.h5fc-select{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--border-color-medium,#cfcfcf);border-radius:8px;background:var(--background-color-high,#fff);color:var(--text-color-high,#222);font-size:13px;font-family:inherit}',
-	'.h5fc-input:focus,.h5fc-select:focus{outline:none;border-color:var(--h5fc-ok);box-shadow:0 0 0 2px rgba(54,201,143,.18)}',
-	'.h5fc-input.err{border-color:var(--h5fc-red);box-shadow:0 0 0 2px rgba(239,98,98,.15)}',
-	'.h5fc-field .h5fc-err{font-size:11px;color:var(--h5fc-red);display:none}',
-	'.h5fc-field.invalid .h5fc-err{display:block}',
-	'.h5fc-slider{display:flex;align-items:center;gap:10px}',
-	'.h5fc-slider input[type=range]{flex:1;min-width:0;accent-color:var(--h5fc-ok)}',
-	'.h5fc-slider .h5fc-input{width:86px;flex:0 0 86px;text-align:center}',
-	/* switch */
-	'.h5fc-switch{position:relative;display:inline-block;width:46px;height:26px;flex:0 0 auto}',
-	'.h5fc-switch input{opacity:0;width:0;height:0;position:absolute}',
-	'.h5fc-switch i{position:absolute;inset:0;border-radius:999px;background:rgba(127,127,127,.35);transition:background .18s}',
-	'.h5fc-switch i:before{content:"";position:absolute;left:3px;top:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .18s}',
-	'.h5fc-switch input:checked+i{background:var(--h5fc-ok)}',
-	'.h5fc-switch input:checked+i:before{transform:translateX(20px)}',
-	'.h5fc-switch input:focus-visible+i{box-shadow:0 0 0 2px rgba(54,201,143,.35)}',
-	/* segmented */
-	'.h5fc-seg{display:flex;gap:4px;padding:4px;border:1px solid var(--border-color-low,#e4e4e4);border-radius:10px;background:rgba(127,127,127,.04);flex-wrap:wrap}',
-	'.h5fc-seg label{flex:1 1 auto;min-width:72px;text-align:center;padding:7px 10px;border-radius:7px;font-size:12px;font-weight:600;color:var(--text-color-medium,#666);cursor:pointer;white-space:nowrap;border:1px solid transparent}',
-	'.h5fc-seg input{position:absolute;opacity:0;pointer-events:none}',
-	'.h5fc-seg input:checked+span,.h5fc-seg label.on{background:linear-gradient(160deg,rgba(54,201,143,.18),rgba(54,201,143,.07));color:var(--h5fc-ok);border-color:rgba(54,201,143,.4)}',
-	'.h5fc-seg label:hover{background:rgba(127,127,127,.08)}',
-	/* buttons */
-	'.h5fc-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border:1px solid var(--border-color-medium,#cfcfcf);border-radius:9px;background:var(--background-color-high,#fff);color:var(--text-color-high,#333);font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}',
-	'.h5fc-btn:hover{border-color:var(--h5fc-ok);color:var(--h5fc-ok)}',
-	'.h5fc-btn.primary{border-color:transparent;background:linear-gradient(160deg,#36c98f,#2aa877);color:#fff}',
-	'.h5fc-btn.primary:hover{filter:brightness(1.06)}',
-	'.h5fc-btn.danger{border-color:rgba(239,98,98,.5);color:var(--h5fc-red)}',
-	'.h5fc-btn:disabled{opacity:.45;cursor:not-allowed}',
-	/* overview layout */
-	'.h5fc-overview{display:grid;grid-template-columns:260px minmax(0,1fr);gap:14px;align-items:stretch}',
-	'.h5fc-fanbox{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:18px 14px}',
-	/* fan svg */
-	'.h5fc-fan-blades{transform-origin:100px 100px;animation:h5fc-spin 2.4s linear infinite;animation-play-state:paused}',
-	'.h5fc-fan-run .h5fc-fan-blades{animation-play-state:running}',
-	'@keyframes h5fc-spin{to{transform:rotate(360deg)}}',
-	'@media (prefers-reduced-motion: reduce){.h5fc-fan-blades{animation:none!important}}',
-	/* monitor */
-	'.h5fc-gauges{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}',
-	'.h5fc-gauge{display:flex;flex-direction:column;align-items:center;gap:2px;padding:14px 12px 12px}',
-	'.h5fc-gauge .h5fc-gauge-name{font-size:12px;font-weight:650;color:var(--text-color-medium,#666);display:flex;align-items:center;gap:6px}',
-	'.h5fc-gauge .h5fc-gauge-src{font-size:10px;color:var(--text-color-low,#999);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-	'.h5fc-gauge.active{border-color:rgba(85,168,255,.55);box-shadow:0 0 0 1px rgba(85,168,255,.25)}',
-	/* curve */
-	'.h5fc-curve-layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;align-items:start}',
-	'.h5fc-curve-svg-wrap{border:1px solid var(--border-color-low,#e4e4e4);border-radius:12px;background:linear-gradient(160deg,rgba(127,127,127,.035),rgba(127,127,127,.015));padding:6px}',
-	'.h5fc-curve-svg{width:100%;height:auto;display:block;touch-action:none}',
-	'.h5fc-nodes{display:grid;gap:6px;max-height:340px;overflow:auto;padding-right:2px}',
-	'.h5fc-node{display:grid;grid-template-columns:1fr 1fr 30px;gap:8px;align-items:center}',
-	'.h5fc-node .h5fc-input{padding:6px 8px;font-size:12px;text-align:right}',
-	'.h5fc-node button{border:0;background:rgba(239,98,98,.12);color:var(--h5fc-red);border-radius:7px;height:30px;cursor:pointer;font-weight:700}',
-	'.h5fc-node button:disabled{opacity:.3;cursor:not-allowed}',
-	/* diagnostics */
-	'.h5fc-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:12.5px}',
-	'.h5fc-kv dt{color:var(--text-color-medium,#666);white-space:nowrap}',
-	'.h5fc-kv dd{margin:0;font-weight:600;word-break:break-all}',
-	'.h5fc-pre{margin:8px 0 0;padding:10px;border-radius:8px;background:rgba(127,127,127,.07);border:1px solid var(--border-color-low,#e4e4e4);font-size:11px;line-height:1.5;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text-color-high,#333)}',
-	'.h5fc-conn-lost{display:none;margin:0 0 14px;padding:10px 12px;border-radius:10px;border:1px solid rgba(239,98,98,.4);background:rgba(239,98,98,.1);color:var(--h5fc-red);font-size:12.5px;font-weight:600}',
-	'.h5fc-conn-lost.show{display:block}',
-	/* responsive */
-	'@media (max-width: 1000px){.h5fc-overview{grid-template-columns:220px minmax(0,1fr)}.h5fc-curve-layout{grid-template-columns:1fr}.h5fc-grid.c4{grid-template-columns:repeat(2,minmax(150px,1fr))}.h5fc-grid.c3{grid-template-columns:repeat(2,minmax(150px,1fr))}}',
-	'@media (max-width: 760px){.h5fc-overview{grid-template-columns:1fr}.h5fc-grid.c2{grid-template-columns:1fr}.h5fc-grid.c3{grid-template-columns:1fr}.h5fc-hero{flex-direction:column;gap:8px}.h5fc-nodes{max-height:240px}}',
-	'@media (max-width: 520px){.h5fc-grid.c4{grid-template-columns:1fr}.h5fc-tab{padding:8px 10px}.h5fc-slider{flex-wrap:wrap}.h5fc-slider input[type=range]{flex:1 1 100%}.h5fc-slider .h5fc-input{flex:1 1 100%;width:100%}}'
-].join('');
-
-/* ------------------------------------------------------------------ *
- * configuration model                                                *
- * ------------------------------------------------------------------ */
-
-var CFG_NAME = 'h5000m_fancontrol';
-var CFG_SID = 'settings';
-
-var OPTIONS = {
-	enabled: { kind: 'bool', def: '1' },
-	mode: { kind: 'enum', def: 'auto', values: ['auto', 'manual', 'kernel'] },
-	curve: { kind: 'enum', def: 'balanced', values: ['silent', 'balanced', 'performance', 'custom'] },
-	temp_source: { kind: 'enum', def: 'max', values: ['max', 'cpu'] },
-	manual_pwm: { kind: 'uint', def: '160', min: 0, max: 255 },
-	interval: { kind: 'uint', def: '5', min: 2, max: 60, unit: 's' },
-	hysteresis: { kind: 'uint', def: '2', min: 0, max: 10, unit: '\u00b0C' },
-	down_delay: { kind: 'uint', def: '30', min: 0, max: 300, unit: 's' },
-	start_pwm: { kind: 'uint', def: '192', min: 80, max: 255 },
-	start_boost_ms: { kind: 'uint', def: '700', min: 0, max: 3000, unit: 'ms' },
-	fail_pwm: { kind: 'uint', def: '255', min: 192, max: 255 },
-	curve_silent: { kind: 'curve', def: '20:0,35:0,40:50,55:50,70:60,85:75,95:100' },
-	curve_balanced: { kind: 'curve', def: '20:0,35:0,40:50,55:60,70:75,85:90,95:100' },
-	curve_performance: { kind: 'curve', def: '20:0,30:60,45:70,60:82,75:92,85:100' },
-	curve_custom: { kind: 'curve', def: '20:0,40:50,55:60,70:75,85:90,95:100' }
-};
-
-/* Temperature bands. CPU boundaries mirror the controller's own kernel
- * cooling-map floors (83/113\u00b0C); the other sensors use conservative
- * plugin reference values - clearly labelled as non-official in the UI. */
-var BANDS_CPU = [
-	{ max: 70, cls: 'ok', label: _('Normal') },
-	{ max: 83, cls: 'warn', label: _('Attention') },
-	{ max: 113, cls: 'hot', label: _('Hot') },
-	{ max: Infinity, cls: 'crit', label: _('Critical') }
-];
-var BANDS_GENERIC = [
-	{ max: 60, cls: 'ok', label: _('Normal') },
-	{ max: 75, cls: 'warn', label: _('Attention') },
-	{ max: 95, cls: 'hot', label: _('Hot') },
-	{ max: Infinity, cls: 'crit', label: _('Critical') }
-];
-
-function bandOf(bands, temp) {
-	if (temp === null || temp === undefined)
-		return null;
-	for (var i = 0; i < bands.length; i++)
-		if (temp < bands[i].max)
-			return bands[i];
-	return bands[bands.length - 1];
-}
-
-function isUInt(s) {
-	return /^\d+$/.test(String(s));
-}
-
-function parseCurve(text) {
-	var points = [], pairs = String(text || '').split(','), i, m, t, p;
-	for (i = 0; i < pairs.length; i++) {
-		m = /^(\d+):(\d+)$/.exec(pairs[i].trim());
-		if (!m)
-			return null;
-		t = +m[1];
-		p = +m[2];
-		if (t > 150 || p > 100)
-			return null;
-		if (points.length && t <= points[points.length - 1].temp)
-			return null;
-		points.push({ temp: t, percent: p });
-	}
-	return points.length ? points : null;
-}
-
-function validateOption(key, value) {
-	var spec = OPTIONS[key];
-	if (!spec)
-		return true;
-	if (spec.kind === 'bool')
-		return (value === '0' || value === '1') ? true : _('Must be 0 or 1.');
-	if (spec.kind === 'enum')
-		return spec.values.indexOf(value) > -1 ? true : _('Invalid value.');
-	if (spec.kind === 'uint') {
-		if (!isUInt(value))
-			return _('Please enter a non-negative integer.');
-		var n = +value;
-		if (n < spec.min || n > spec.max)
-			return _('Allowed range: %d\u2013%d').format(spec.min, spec.max);
-		return true;
-	}
-	if (spec.kind === 'curve') {
-		if (!parseCurve(value))
-			return _('Use comma-separated temperature:percent points, e.g. 35:0,45:50,70:80,90:100. Temperatures must rise, 0\u2013150\u00b0C, percentages 0\u2013100.');
-		return true;
-	}
-	return true;
-}
-
-/* PWM output of a curve at a temperature, mirroring the controller's
- * integer interpolation. */
-function curvePwm(temp, points) {
-	var prev = null, i, pt, result;
-	for (i = 0; i < points.length; i++) {
-		pt = points[i];
-		if (temp <= pt.temp) {
-			if (!prev)
-				result = pt.percent;
-			else
-				result = prev.percent + Math.trunc((temp - prev.temp) * (pt.percent - prev.percent) / (pt.temp - prev.temp));
-			return Math.trunc(result * 255 / 100);
-		}
-		prev = pt;
-	}
-	return prev ? Math.trunc(prev.percent * 255 / 100) : null;
-}
-
-function fmtTemp(v) {
-	return (v === null || v === undefined) ? '\u2014' : _('%d\u00b0C').format(v);
-}
-
-function fmtPwm(v) {
-	return (v === null || v === undefined) ? '\u2014' : _('%d / 255 (%d%%)').format(v, Math.round(v * 100 / 255));
-}
-
-function clamp(v, min, max) {
-	return Math.max(min, Math.min(max, v));
-}
-
+var STATUS_CMD = '/usr/sbin/h5000m-fancontrol-status';
+var APPLY_CMD = '/usr/sbin/h5000m-fancontrol';
+var INITD_CMD = '/etc/init.d/h5000m-fancontrol';
+var CFG = 'h5000m_fancontrol';
+var SID = 'settings';
+var TAB_KEY = 'luci.h5000m-fancontrol.tab';
+var REFRESH_SECONDS = 5;
 var SVG_NS = 'http://www.w3.org/2000/svg';
 
-/* LuCI's E() creates HTML elements; SVG nodes need their own namespace. */
-function svgEl(name, attrs, text) {
-	var el = document.createElementNS(SVG_NS, name), key;
-	attrs = attrs || {};
-	for (key in attrs) {
-		if (attrs[key] !== undefined && attrs[key] !== null)
-			el.setAttribute(key, attrs[key]);
+/*
+ * Reference bands are this project's own assessment, aligned with the knee
+ * points of the shipped curves. They are not vendor datasheet limits, and the
+ * UI says so instead of implying a manufacturer specification.
+ */
+var BANDS = {
+	cpu: { watch: 70, hot: 85, critical: 95 },
+	phy: { watch: 70, hot: 80, critical: 90 },
+	radio: { watch: 75, hot: 88, critical: 95 },
+	modem: { watch: 70, hot: 82, critical: 90 }
+};
+
+var SENSOR_SLOTS = [
+	{ id: 'cpu', title: 'CPU', band: BANDS.cpu },
+	{ id: 'phy', title: 'Ethernet PHY', band: BANDS.phy },
+	{ id: 'wifi1', title: 'Wi-Fi radio 1', band: BANDS.radio },
+	{ id: 'wifi2', title: 'Wi-Fi radio 2', band: BANDS.radio },
+	{ id: 'module', title: '5G modem', band: BANDS.modem }
+];
+
+var TABS = [
+	{ id: 'overview', label: 'Overview' },
+	{ id: 'control', label: 'Fan control' },
+	{ id: 'curve', label: 'Fan curve' },
+	{ id: 'monitor', label: 'Temperature' },
+	{ id: 'system', label: 'Settings' },
+	{ id: 'diagnostics', label: 'Diagnostics' }
+];
+
+/*
+ * Every editable option in one place: widget kind, bounds, shipped default and
+ * the tab that owns it. `policy: true` marks the options whose value changes
+ * need a control cycle, which keeps Save from poking the controller when only
+ * cosmetic values moved.
+ */
+var OPTIONS = {
+	enabled: {
+		kind: 'switch', tab: 'control', policy: true, def: '1',
+		label: 'Enable enhanced controller',
+		hint: 'When disabled the fan follows the kernel thermal policy only; CPU throttling and over-temperature protection are unaffected.',
+		choices: [['1', 'Enabled'], ['0', 'Disabled']]
+	},
+	mode: {
+		kind: 'select', tab: 'control', policy: true, def: 'auto',
+		label: 'Operating mode',
+		hint: 'Automatic uses the fan curve, Manual keeps a fixed output, Kernel protection only leaves the fan to the kernel.',
+		choices: [['auto', 'Automatic'], ['manual', 'Manual'], ['kernel', 'Kernel protection only']]
+	},
+	curve: {
+		kind: 'select', tab: 'control', policy: true, def: 'balanced',
+		label: 'Cooling profile',
+		hint: 'Only used in automatic mode.',
+		choices: [['silent', 'Quiet'], ['balanced', 'Balanced'], ['performance', 'Performance'], ['custom', 'Custom']]
+	},
+	manual_pwm: {
+		kind: 'slider', tab: 'control', policy: true, def: '160', min: 0, max: 255, unit: '0-255',
+		label: 'Manual PWM output',
+		hint: 'The kernel safety floor can still raise the effective output above this value.'
+	},
+	start_pwm: {
+		kind: 'number', tab: 'control', policy: true, def: '192', min: 80, max: 255, unit: '0-255',
+		label: 'Startup boost PWM',
+		hint: 'Short high pulse written only when the fan is standing still.'
+	},
+	start_boost_ms: {
+		kind: 'number', tab: 'control', policy: true, def: '700', min: 0, max: 3000, unit: 'ms',
+		label: 'Startup boost duration',
+		hint: 'Set 0 to disable the boost.'
+	},
+	temp_source: {
+		kind: 'select', tab: 'system', policy: true, def: 'max',
+		label: 'Control temperature',
+		hint: 'The hottest option considers CPU, Ethernet PHY, both radios and the 5G modem cache.',
+		choices: [['max', 'Hottest valid sensor'], ['cpu', 'CPU only']]
+	},
+	interval: {
+		kind: 'number', tab: 'system', policy: true, def: '5', min: 2, max: 60, unit: 's',
+		label: 'Sampling interval',
+		hint: 'Seconds between control decisions. The page refreshes independently of this.'
+	},
+	hysteresis: {
+		kind: 'number', tab: 'system', policy: true, def: '2', min: 0, max: 10, unit: '°C',
+		label: 'Temperature hysteresis',
+		hint: 'Extra degrees applied when slowing down, so the fan does not oscillate around a curve point.'
+	},
+	down_delay: {
+		kind: 'number', tab: 'system', policy: true, def: '30', min: 0, max: 300, unit: 's',
+		label: 'Spin-down delay',
+		hint: 'Hold the current output this long before slowing down. Speed-ups stay immediate.'
+	},
+	fail_pwm: {
+		kind: 'number', tab: 'system', policy: true, def: '255', min: 192, max: 255, unit: '0-255',
+		label: 'Failsafe output',
+		hint: 'Used when no sensor or no usable curve is available; the range keeps it above 75%.'
+	},
+	curve_custom: {
+		kind: 'curve', tab: 'curve', policy: true, def: '20:0,40:50,55:60,70:75,85:90,95:100',
+		label: 'Custom curve',
+		hint: 'Comma separated temperature:percent pairs, temperatures strictly increasing.'
+	},
+	curve_silent: {
+		kind: 'curve', tab: 'system', policy: true, def: '20:0,35:0,40:50,55:50,70:60,85:75,95:100',
+		label: 'Quiet curve',
+		hint: 'Preset used by the Quiet profile. Restore defaults puts this line back.'
+	},
+	curve_balanced: {
+		kind: 'curve', tab: 'system', policy: true, def: '20:0,35:0,40:50,55:60,70:75,85:90,95:100',
+		label: 'Balanced curve',
+		hint: 'Preset used by the Balanced profile.'
+	},
+	curve_performance: {
+		kind: 'curve', tab: 'system', policy: true, def: '20:0,30:60,45:70,60:82,75:92,85:100',
+		label: 'Performance curve',
+		hint: 'Preset used by the Performance profile.'
 	}
-	if (text !== undefined && text !== null)
-		el.appendChild(document.createTextNode(String(text)));
-	return el;
+};
+
+var POLICY_KEYS = Object.keys(OPTIONS).filter(function(key) {
+	return OPTIONS[key].policy;
+});
+
+/* Which stored curve each profile uses, mirroring config::curve_spec(). */
+var CURVE_OPTION = {
+	silent: 'curve_silent',
+	balanced: 'curve_balanced',
+	performance: 'curve_performance',
+	custom: 'curve_custom'
+};
+
+/* ---------------------------------------------------------------- helpers */
+
+function num(value) {
+	var parsed = parseInt(value, 10);
+	return isNaN(parsed) ? null : parsed;
 }
 
-return view.extend({
-	/* ----------------------------------------------------------- *
-	 * data loading                                                *
-	 * ----------------------------------------------------------- */
+function isUInt(value) {
+	return /^[0-9]+$/.test(String(value === null || value === undefined ? '' : value).trim());
+}
 
-	load: function() {
-		var self = this;
-		return uci.load(CFG_NAME).then(function() {
-			self.resetWorkingCopy();
-			return self.fetchStatus();
+function known(value) {
+	return value !== null && value !== undefined && value !== '';
+}
+
+function clamp(value, min, max) {
+	return Math.max(min, Math.min(max, value));
+}
+
+/* Matches the backend's percent_of_pwm rounding, so both agree on one number. */
+function percentOfPwm(value) {
+	return Math.round(clamp(value, 0, 255) * 100 / 255);
+}
+
+function dash(value) {
+	return known(value) ? String(value) : '\u2014';
+}
+
+function formatTemp(value) {
+	return known(value) ? _('%s °C').format(value) : _('Unknown');
+}
+
+function formatAge(seconds) {
+	if (!known(seconds))
+		return _('Never sampled');
+
+	if (seconds <= 1)
+		return _('Just now');
+
+	return _('Last %s s ago').format(seconds);
+}
+
+function formatClock(seconds) {
+	var date = new Date(seconds * 1000);
+
+	if (isNaN(date.getTime()))
+		return '\u2014';
+
+	return '%04d-%02d-%02d %02d:%02d:%02d'.format(
+		date.getFullYear(), date.getMonth() + 1, date.getDate(),
+		date.getHours(), date.getMinutes(), date.getSeconds());
+}
+
+/*
+ * Curve parsing and evaluation, mirroring the Rust backend exactly:
+ * non-negative integers only, temperature strictly increasing and within 150,
+ * percent within 100, linear interpolation with integer division truncating
+ * towards zero, then percent * 255 / 100.
+ */
+function parseCurve(spec) {
+	var points = [], tokens = String(spec || '').split(','), previous = null, i;
+
+	for (i = 0; i < tokens.length; i++) {
+		var token = tokens[i].trim();
+
+		if (token === '')
+			continue;
+
+		var parts = token.split(':');
+
+		if (parts.length !== 2)
+			return { points: [], error: _('Write each point as temperature:percent, for example 40:50.') };
+
+		if (!isUInt(parts[0]) || !isUInt(parts[1]))
+			return { points: [], error: _('%s is not a pair of whole numbers.').format(token) };
+
+		var temp = parseInt(parts[0], 10), percent = parseInt(parts[1], 10);
+
+		if (temp > 150)
+			return { points: [], error: _('Temperature %s °C is above the supported 150 °C.').format(temp) };
+
+		if (percent > 100)
+			return { points: [], error: _('Percentage %s is above 100%.').format(percent) };
+
+		if (previous !== null && temp <= previous)
+			return { points: [], error: _('Temperature %s °C does not rise above %s °C.').format(temp, previous) };
+
+		points.push({ temp: temp, percent: percent });
+		previous = temp;
+	}
+
+	if (points.length < 2)
+		return { points: points, error: _('The curve needs at least two points.') };
+
+	if (points.length > 32)
+		return { points: points, error: _('The curve accepts at most 32 points.') };
+
+	return { points: points, error: null };
+}
+
+function curvePercentAt(points, temp) {
+	var i;
+
+	if (!points || points.length < 2)
+		return null;
+
+	if (temp <= points[0].temp)
+		return points[0].percent;
+
+	for (i = 1; i < points.length; i++) {
+		if (temp <= points[i].temp) {
+			var previous = points[i - 1], span = points[i].temp - previous.temp;
+
+			if (span === 0)
+				return points[i].percent;
+
+			return previous.percent + Math.trunc((temp - previous.temp) * (points[i].percent - previous.percent) / span);
+		}
+	}
+
+	return points[points.length - 1].percent;
+}
+
+function curveRawAt(points, temp) {
+	var percent = curvePercentAt(points, temp);
+	return percent === null ? null : Math.trunc(percent * 255 / 100);
+}
+
+function svgEl(name, attrs, children) {
+	var node = document.createElementNS(SVG_NS, name), key;
+
+	for (key in (attrs || {})) {
+		if (!attrs.hasOwnProperty(key) || attrs[key] === null || attrs[key] === undefined)
+			continue;
+
+		node.setAttribute(key, String(attrs[key]));
+	}
+
+	(children || []).forEach(function(child) {
+		if (child === null || child === undefined)
+			return;
+
+		node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+	});
+
+	return node;
+}
+
+function show(node, visible) {
+	node.setAttribute('display', visible ? 'inline' : 'none');
+}
+
+function clear(node) {
+	while (node.firstChild)
+		node.removeChild(node.firstChild);
+}
+
+function row(labelText, valueNode) {
+	return E('div', { 'class': 'h5fan-row' }, [
+		E('span', { 'class': 'h5fan-row-key' }, [ _(labelText) ]),
+		valueNode
+	]);
+}
+
+function textValue(text, tone) {
+	return E('span', { 'class': 'h5fan-row-val%s'.format(known(tone) ? ' is-%s'.format(tone) : '') }, [ String(text) ]);
+}
+
+function tag(text, tone) {
+	return E('span', { 'class': 'h5fan-tag%s'.format(known(tone) ? ' is-%s'.format(tone) : '') }, [ String(text) ]);
+}
+
+/* ------------------------------------------------------------------ views */
+
+function mountFanDiagram() {
+	var blades = [], i;
+
+	for (i = 0; i < 7; i++) {
+		blades.push(svgEl('path', {
+			d: 'M100 100 C 100 60, 130 50, 146 67 C 130 76, 119 88, 117 105 Z',
+			transform: 'rotate(%d 100 100)'.format(i * (360 / 7)),
+			'class': 'h5fan-blade'
+		}));
+	}
+
+	var rotor = svgEl('g', { 'class': 'h5fan-rotor' }, blades.concat([
+		svgEl('circle', { cx: 100, cy: 100, r: 18, 'class': 'h5fan-hub' })
+	]));
+	var readout = svgEl('text', { x: 100, y: 106, 'class': 'h5fan-fan-num', 'text-anchor': 'middle' }, [ '\u2014' ]);
+	var caption = svgEl('text', { x: 100, y: 192, 'class': 'h5fan-fan-caption', 'text-anchor': 'middle' }, [ _('Loading…') ]);
+	var svg = svgEl('svg', {
+		viewBox: '0 0 200 200', 'class': 'h5fan-fan', role: 'img',
+		preserveAspectRatio: 'xMidYMid meet', 'aria-label': _('Fan diagram')
+	}, [
+		svgEl('title', {}, [ _('Fan diagram') ]),
+		svgEl('desc', {}, [ _('Schematic fan. The animation follows the applied controller output and is not a measured shaft speed.') ]),
+		svgEl('circle', { cx: 100, cy: 100, r: 90, 'class': 'h5fan-housing' }),
+		svgEl('circle', { cx: 100, cy: 100, r: 78, 'class': 'h5fan-shroud' }),
+		rotor, readout, caption
+	]);
+
+	svg.h5update = function(status) {
+		var fan = status.fan || {}, controller = status.controller || {};
+		var health = controller.health || 'stopped';
+		var applied = known(fan.applied_pwm) ? fan.applied_pwm : null;
+		var live = known(fan.pwm_value) ? fan.pwm_value : applied;
+		var percent = known(live) ? percentOfPwm(live) : null;
+		var classes = [ 'h5fan-fan' ];
+
+		if (health === 'error' || health === 'stopped')
+			classes.push('is-unknown');
+		else if (health === 'failsafe')
+			classes.push('is-fault');
+		else if (percent === null || percent === 0)
+			classes.push('is-stopped');
+		else if (percent < 34)
+			classes.push('is-slow');
+		else if (percent < 67)
+			classes.push('is-medium');
+		else
+			classes.push('is-fast');
+
+		svg.setAttribute('class', classes.join(' '));
+		readout.textContent = percent === null ? '\u2014' : '%d%%'.format(percent);
+
+		if (health === 'failsafe')
+			caption.textContent = _('Failsafe cooling');
+		else if (health === 'error')
+			caption.textContent = _('Controller error');
+		else if (health === 'stopped')
+			caption.textContent = _('Controller not running');
+		else if (percent === null)
+			caption.textContent = _('No output reading');
+		else if (percent === 0)
+			caption.textContent = _('Stopped by policy');
+		else if (fan.kernel_floor_applied)
+			caption.textContent = _('Raised by the kernel floor');
+		else
+			caption.textContent = _('Output %d%%').format(percent);
+
+		svg.setAttribute('aria-label', _('Fan output %1$s, %2$s').format(
+			percent === null ? _('unknown') : '%d%%'.format(percent), caption.textContent));
+	};
+
+	return svg;
+}
+
+function mountGauge(label) {
+	var radius = 44, circumference = 2 * Math.PI * radius;
+	var value = svgEl('circle', {
+		cx: 58, cy: 58, r: radius, 'class': 'h5fan-gauge-value',
+		'stroke-dasharray': '0 %s'.format(circumference),
+		transform: 'rotate(-90 58 58)'
+	});
+	var number = svgEl('text', { x: 58, y: 60, 'class': 'h5fan-gauge-num', 'text-anchor': 'middle' }, [ '\u2014' ]);
+	var svg = svgEl('svg', {
+		viewBox: '0 0 116 116', 'class': 'h5fan-gauge', role: 'img', 'aria-label': _(label)
+	}, [
+		svgEl('title', {}, [ _(label) ]),
+		value,
+		svgEl('circle', { cx: 58, cy: 58, r: radius, 'class': 'h5fan-gauge-track' }),
+		number,
+		svgEl('text', { x: 58, y: 78, 'class': 'h5fan-gauge-unit', 'text-anchor': 'middle' }, [ '% ' + _('of full speed') ])
+	]);
+
+	svg.h5update = function(percent, tone) {
+		var shown = known(percent) ? clamp(percent, 0, 100) : 0;
+
+		value.setAttribute('stroke-dasharray', '%s %s'.format(circumference * shown / 100, circumference));
+		value.setAttribute('class', 'h5fan-gauge-value is-%s'.format(tone || 'idle'));
+		number.textContent = known(percent) ? '%d'.format(shown) : '\u2014';
+		svg.setAttribute('aria-label', '%s: %s'.format(_(label),
+			known(percent) ? '%d%%'.format(shown) : _('Unavailable')));
+	};
+
+	return svg;
+}
+
+function mountTempBar(slot) {
+	var width = 240, height = 62, min = 20, max = 105, inner = width - 24;
+	var title = svgEl('text', { x: 12, y: 15, 'class': 'h5fan-bar-name' }, [ _(slot.title) ]);
+	var value = svgEl('text', { x: width - 12, y: 15, 'class': 'h5fan-bar-value', 'text-anchor': 'end' }, [ _('Unknown') ]);
+	var track = svgEl('rect', { x: 12, y: 28, width: inner, height: 11, rx: 5.5, 'class': 'h5fan-bar-track' });
+	var fill = svgEl('rect', { x: 12, y: 28, width: 0, height: 11, rx: 5.5, 'class': 'h5fan-bar-fill' });
+	var hatched = svgEl('rect', { x: 12, y: 28, width: inner, height: 11, rx: 5.5, 'class': 'h5fan-bar-hatched' });
+	var note = svgEl('text', { x: 12, y: 55, 'class': 'h5fan-bar-note' }, [ '' ]);
+	var marks = [ slot.band.watch, slot.band.hot, slot.band.critical ].map(function(level) {
+		var x = 12 + (clamp(level, min, max) - min) / (max - min) * inner;
+		return svgEl('line', { x1: x, y1: 24, x2: x, y2: 43, 'class': 'h5fan-bar-tick' });
+	});
+	var svg = svgEl('svg', {
+		viewBox: '0 0 %d %d'.format(width, height), 'class': 'h5fan-bar',
+		role: 'img', 'aria-label': _(slot.title)
+	}, [ svgEl('title', {}, [ _(slot.title) ]), track, hatched, fill, title, value, note ].concat(marks));
+
+	svg.h5update = function(reading) {
+		var has = !!(reading && reading.valid && known(reading.value_c));
+		var tone = 'unknown';
+
+		show(hatched, !has);
+		fill.setAttribute('width', has ? String(inner * (clamp(reading.value_c, min, max) - min) / (max - min)) : '0');
+
+		if (has) {
+			if (reading.value_c >= slot.band.critical)
+				tone = 'critical';
+			else if (reading.value_c >= slot.band.hot)
+				tone = 'hot';
+			else if (reading.value_c >= slot.band.watch)
+				tone = 'watch';
+			else
+				tone = 'ok';
+		} else if (reading && reading.status === 'stale') {
+			tone = 'stale';
+		} else if (reading && (reading.status === 'invalid' || reading.status === 'failed')) {
+			tone = 'bad';
+		}
+
+		fill.setAttribute('class', 'h5fan-bar-fill is-%s'.format(tone));
+		value.textContent = has ? formatTemp(reading.value_c) : _('Unknown');
+		note.textContent = reading
+			? (has
+				? '%s · %s'.format(reading.source || '\u2014', formatAge(reading.age_s))
+				: '%s · %s'.format(_(stateName(reading.status)), reading.error || _('no reading')))
+			: '';
+		svg.setAttribute('aria-label', '%s: %s'.format(_(slot.title),
+			has ? formatTemp(reading.value_c) : _('Unavailable')));
+	};
+
+	return svg;
+}
+
+function mountCurveChart() {
+	var width = 660, height = 300, left = 46, right = 16, top = 20, bottom = 34;
+	var plotWidth = width - left - right, plotHeight = height - top - bottom;
+	var minTemp = 20, maxTemp = 110;
+
+	function xFor(temp) {
+		return left + clamp((temp - minTemp) / (maxTemp - minTemp), 0, 1) * plotWidth;
+	}
+
+	function yFor(percent) {
+		return top + (100 - clamp(percent, 0, 100)) * plotHeight / 100;
+	}
+
+	var grid = svgEl('g', { 'class': 'h5fan-grid' });
+	var axis = svgEl('g', { 'class': 'h5fan-axis' });
+	var area = svgEl('path', { 'class': 'h5fan-area', fill: 'url(#h5fan-area-grad)' });
+	var line = svgEl('path', { 'class': 'h5fan-curve' });
+	var floorLine = svgEl('line', { 'class': 'h5fan-floor', x1: left, x2: left + plotWidth });
+	var targetLine = svgEl('line', { 'class': 'h5fan-target', x1: left, x2: left + plotWidth });
+	var cursor = svgEl('line', { 'class': 'h5fan-cursor', y1: top, y2: top + plotHeight });
+	var marker = svgEl('circle', { 'class': 'h5fan-marker', r: 6 });
+	var markerText = svgEl('text', { 'class': 'h5fan-marker-text', 'text-anchor': 'middle', y: top - 5 });
+	var nodes = svgEl('g', {});
+	var error = svgEl('text', {
+		x: width / 2, y: height / 2, 'class': 'h5fan-chart-error', 'text-anchor': 'middle'
+	}, [ '' ]);
+
+	[ 0, 25, 50, 75, 100 ].forEach(function(level) {
+		grid.appendChild(svgEl('line', {
+			x1: left, x2: left + plotWidth, y1: yFor(level), y2: yFor(level), 'class': 'h5fan-grid-line'
+		}));
+		axis.appendChild(svgEl('text', {
+			x: left - 8, y: yFor(level) + 4, 'class': 'h5fan-tick', 'text-anchor': 'end'
+		}, [ '%d%%'.format(level) ]));
+	});
+
+	[ 20, 35, 50, 65, 80, 95, 110 ].forEach(function(temp) {
+		grid.appendChild(svgEl('line', {
+			x1: xFor(temp), x2: xFor(temp), y1: top, y2: top + plotHeight, 'class': 'h5fan-grid-line'
+		}));
+		axis.appendChild(svgEl('text', {
+			x: xFor(temp), y: height - 14, 'class': 'h5fan-tick', 'text-anchor': 'middle'
+		}, [ '%d°'.format(temp) ]));
+	});
+
+	axis.appendChild(svgEl('line', { x1: left, x2: left, y1: top, y2: top + plotHeight, 'class': 'h5fan-axis-line' }));
+	axis.appendChild(svgEl('line', {
+		x1: left, x2: left + plotWidth, y1: top + plotHeight, y2: top + plotHeight, 'class': 'h5fan-axis-line'
+	}));
+	axis.appendChild(svgEl('text', { x: left, y: height - 2, 'class': 'h5fan-axis-name' }, [ _('Temperature (°C)') ]));
+
+	var svg = svgEl('svg', {
+		viewBox: '0 0 %d %d'.format(width, height), 'class': 'h5fan-chart',
+		role: 'img', preserveAspectRatio: 'xMidYMid meet', 'aria-label': _('Fan curve')
+	}, [
+		svgEl('title', {}, [ _('Temperature to fan output curve') ]),
+		svgEl('desc', {}, [ _('Every point on the line is the output the controller applies at that temperature.') ]),
+		svgEl('defs', {}, [ svgEl('linearGradient', {
+			id: 'h5fan-area-grad', x1: '0', y1: '0', x2: '0', y2: '1'
+		}, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#2ea97a', 'stop-opacity': '0.30' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#2ea97a', 'stop-opacity': '0.03' })
+		]) ]),
+		grid, axis, area, line, floorLine, targetLine, cursor, marker, markerText, nodes, error
+	]);
+
+	svg.h5update = function(data) {
+		var points = data.points || [];
+		var usable = !data.error && points.length >= 2;
+
+		error.textContent = data.error || '';
+		show(error, !!data.error);
+		show(line, usable);
+		show(area, usable);
+
+		if (!usable) {
+			clear(nodes);
+			show(marker, false);
+			show(cursor, false);
+			show(targetLine, false);
+			show(floorLine, false);
+			markerText.textContent = '';
+			svg.setAttribute('aria-label', _('Curve unavailable: %s').format(data.error || ''));
+			return;
+		}
+
+		var path = '', i;
+
+		for (i = minTemp; i <= maxTemp; i++)
+			path += '%s%s %s'.format(i === minTemp ? 'M' : 'L', xFor(i).toFixed(2), yFor(curvePercentAt(points, i)).toFixed(2));
+
+		line.setAttribute('d', path);
+		area.setAttribute('d', '%s L%s %s L%s %s Z'.format(
+			path, xFor(maxTemp).toFixed(2), (top + plotHeight), xFor(minTemp).toFixed(2), (top + plotHeight)));
+
+		clear(nodes);
+
+		points.forEach(function(point) {
+			nodes.appendChild(svgEl('circle', {
+				cx: xFor(point.temp), cy: yFor(point.percent), r: 4.5, 'class': 'h5fan-node-dot'
+			}));
+			nodes.appendChild(svgEl('text', {
+				x: xFor(point.temp), y: yFor(point.percent) - 10,
+				'class': 'h5fan-node-text', 'text-anchor': 'middle'
+			}, [ '%d°:%d%%'.format(point.temp, point.percent) ]));
 		});
-	},
+
+		if (known(data.targetPercent)) {
+			targetLine.setAttribute('y1', yFor(data.targetPercent));
+			targetLine.setAttribute('y2', yFor(data.targetPercent));
+			show(targetLine, true);
+		} else {
+			show(targetLine, false);
+		}
+
+		if (known(data.floorPercent) && data.floorPercent > 0) {
+			floorLine.setAttribute('y1', yFor(data.floorPercent));
+			floorLine.setAttribute('y2', yFor(data.floorPercent));
+			show(floorLine, true);
+		} else {
+			show(floorLine, false);
+		}
+
+		if (data.control && known(data.control.temp_c)) {
+			var at = curvePercentAt(points, data.control.temp_c);
+			cursor.setAttribute('x1', xFor(data.control.temp_c));
+			cursor.setAttribute('x2', xFor(data.control.temp_c));
+			show(cursor, true);
+			marker.setAttribute('cx', xFor(data.control.temp_c));
+			marker.setAttribute('cy', yFor(at));
+			show(marker, true);
+			markerText.setAttribute('x', clamp(xFor(data.control.temp_c), left + 46, width - right - 46));
+			markerText.textContent = '%d °C · %d%%'.format(data.control.temp_c, at);
+			svg.setAttribute('aria-label', _('%1$s at %2$s gives %3$d%% output').format(
+				data.control.sensor_label || _('control temperature'),
+				formatTemp(data.control.temp_c), at));
+		} else {
+			show(cursor, false);
+			show(marker, false);
+			markerText.textContent = '';
+			svg.setAttribute('aria-label', _('Fan curve'));
+		}
+	};
+
+	return svg;
+}
+
+function stateName(state) {
+	if (state === 'ok')
+		return 'Valid';
+
+	if (state === 'stale')
+		return 'Stale';
+
+	if (state === 'invalid')
+		return 'Invalid value';
+
+	if (state === 'failed')
+		return 'Read failed';
+
+	return 'Not present';
+}
+
+function healthName(health) {
+	if (health === 'failsafe')
+		return _('Failsafe cooling active');
+
+	if (health === 'stale')
+		return _('Status is stale');
+
+	if (health === 'error')
+		return _('Controller error');
+
+	if (health === 'stopped')
+		return _('Controller not running');
+
+	return _('Running normally');
+}
+
+function healthTone(health) {
+	if (health === 'error' || health === 'stopped')
+		return 'fail';
+
+	if (health === 'stale' || health === 'failsafe')
+		return 'warn';
+
+	return 'ok';
+}
+
+function reasonName(reason) {
+	var base = String(reason || ''), raised = base.indexOf('+kernel-floor') > -1, text;
+
+	base = base.replace('+kernel-floor', '');
+
+	if (base === 'auto')
+		text = _('Automatic curve');
+	else if (base === 'auto-down-delay')
+		text = _('Holding output before slowing down');
+	else if (base === 'manual')
+		text = _('Manual request');
+	else if (base === 'kernel')
+		text = _('Kernel protection');
+	else if (base === 'sensor-failsafe')
+		text = _('Sensor failsafe');
+	else if (base === 'curve-failsafe')
+		text = _('Curve failsafe');
+	else if (base === 'pwm-missing')
+		text = _('Fan control node not found');
+	else if (base === 'pwm-write-failed')
+		text = _('Writing the fan output failed');
+	else if (base === 'no-snapshot')
+		text = _('No cycle published yet');
+	else
+		text = base || _('Unknown');
+
+	return raised ? _('%s · raised by the kernel floor').format(text) : text;
+}
+
+/* ---------------------------------------------------------------- the view */
+
+return view.extend({
+	status: null,
+	fetchError: null,
+	values: null,
+	original: null,
+	widgets: null,
+	charts: null,
+	tabId: 'overview',
+
+	title: _('Fan Control'),
+
+	/* ------------------------------------------------------------- loading */
 
 	fetchStatus: function() {
-		var self = this;
-		return fs.exec('/usr/sbin/h5000m-fancontrol-status').then(function(res) {
-			var data = null;
-			if (res && res.code === 0 && res.stdout) {
-				try {
-					data = JSON.parse(res.stdout);
-				}
-				catch (e) {
-					data = null;
-				}
-			}
-			self.statusBroken = !data;
-			return data;
-		}, function() {
-			self.statusBroken = true;
+		return fs.exec(STATUS_CMD, [ 'json' ]).then(L.bind(function(result) {
+			if (result && result.code !== 0)
+				throw new Error(_('The status command exited with code %s').format(result.code));
+
+			var payload = JSON.parse(String(result.stdout || ''));
+
+			if (!payload || typeof payload !== 'object' || !payload.controller || !payload.settings)
+				throw new Error(_('The status reply does not match the expected contract'));
+
+			this.fetchError = null;
+			this.status = payload;
+		}, this)).catch(L.bind(function(err) {
+			this.fetchError = (err && err.message) ? err.message : String(err);
+		}, this));
+	},
+
+	load: function() {
+		return Promise.all([
+			uci.load(CFG).catch(L.bind(function(err) {
+				this.fetchError = (err && err.message) ? err.message : String(err);
+			}, this)),
+			this.fetchStatus()
+		]).then(L.bind(function() {
+			this.readStoredConfig();
 			return null;
-		});
+		}, this));
 	},
 
-	uciValue: function(key) {
-		var v = uci.get(CFG_NAME, CFG_SID, key);
-		return (v === undefined || v === null || v === '') ? OPTIONS[key].def : String(v);
-	},
+	readStoredConfig: function() {
+		var values = {}, original = {}, key;
 
-	resetWorkingCopy: function() {
-		this.values = {};
-		this.orig = {};
-		for (var key in OPTIONS) {
-			this.values[key] = this.uciValue(key);
-			this.orig[key] = this.values[key];
-		}
-		this.updateDirtyDots();
-	},
-
-	dirtyKeys: function() {
-		var dirty = [], key;
-		for (key in OPTIONS)
-			if (String(this.values[key]) !== String(this.orig[key]))
-				dirty.push(key);
-		return dirty;
-	},
-
-	setValue: function(key, value) {
-		this.values[key] = String(value);
-		this.updateDirtyDots();
-	},
-
-	updateDirtyDots: function() {
-		var dirty = this.dirtyKeys().length > 0;
-		var tabs = document.querySelectorAll('.h5fc-tab');
-		for (var i = 0; i < tabs.length; i++)
-			tabs[i].setAttribute('data-dirty', dirty ? '1' : '0');
-	},
-
-	/* ----------------------------------------------------------- *
-	 * save / apply / reset (header buttons)                       *
-	 * ----------------------------------------------------------- */
-
-	validateAll: function() {
-		var errors = [], key, res;
 		for (key in OPTIONS) {
-			res = validateOption(key, this.values[key]);
-			if (res !== true)
-				errors.push(key + ': ' + res);
-		}
-		return errors;
-	},
+			var stored = null;
 
-	handleSaveApply: function(ev /*, mode */) {
-		return this.commit(true);
-	},
+			try {
+				stored = uci.get(CFG, SID, key);
+			} catch (err) {
+				stored = null;
+			}
 
-	handleSave: function(ev) {
-		return this.commit(false);
-	},
+			if (!known(stored))
+				stored = known(this.settings()[key]) ? String(this.settings()[key]) : OPTIONS[key].def;
 
-	handleReset: function(ev) {
-		var self = this;
-		return uci.unload(CFG_NAME).then(function() {
-			return uci.load(CFG_NAME);
-		}).then(function() {
-			self.resetWorkingCopy();
-			self.rebuildStaticWidgets();
-			ui.addNotification(null, E('p', _('Unsaved changes have been discarded.')), 'info');
-		});
-	},
+			if (key === 'enabled')
+				stored = (stored === '0' || stored === false) ? '0' : '1';
 
-	commit: function(applyNow) {
-		var self = this, errors = this.validateAll(), dirty = this.dirtyKeys();
-
-		if (errors.length) {
-			ui.addNotification(null, E('p', _('Cannot save the configuration:') + '<br>' + errors.join('<br>')), 'error');
-			return Promise.reject(new Error(errors[0]));
+			values[key] = String(stored);
+			original[key] = String(stored);
 		}
 
-		if (!dirty.length) {
-			if (applyNow)
-				return self.runApply().then(function() {
-					ui.addNotification(null, E('p', _('Configuration unchanged; control cycle executed.')));
-				});
-			return Promise.resolve();
+		this.values = values;
+		this.original = original;
+	},
+
+	settings: function() {
+		return (this.status && this.status.settings) || {};
+	},
+
+	fanState: function() {
+		return (this.status && this.status.fan) || {};
+	},
+
+	thermal: function() {
+		return (this.status && this.status.thermal) || {};
+	},
+
+	protections: function() {
+		return this.thermal().protections || {};
+	},
+
+	controller: function() {
+		return (this.status && this.status.controller) || {};
+	},
+
+	sensorById: function(id) {
+		var list = (this.status && this.status.sensors) || [], i;
+
+		for (i = 0; i < list.length; i++) {
+			if (list[i].id === id)
+				return list[i];
 		}
 
-		var disableConfirmed = true;
-		if (this.orig.enabled === '1' && this.values.enabled === '0')
-			disableConfirmed = false;
-
-		var manualLow = false;
-		if (this.values.mode === 'manual' && isUInt(this.values.manual_pwm) && +this.values.manual_pwm < 80)
-			manualLow = true;
-
-		return this.confirmation(
-			(!disableConfirmed ? _('The enhanced controller is about to be disabled. The fan will follow the kernel thermal policy only. Continue?') : null),
-			(manualLow ? _('Manual PWM below 80 may be too low to keep the fan spinning. Continue?') : null)
-		).then(function(confirmed) {
-			if (!confirmed)
-				return null;
-
-			if (!uci.get(CFG_NAME, CFG_SID))
-				uci.add(CFG_NAME, 'settings', CFG_SID);
-			for (var key in OPTIONS)
-				uci.set(CFG_NAME, CFG_SID, key, String(self.values[key]));
-			return uci.save()
-				.then(function() { return uci.apply(); })
-				.then(function() {
-					for (var key in OPTIONS)
-						self.orig[key] = String(self.values[key]);
-					self.updateDirtyDots();
-					if (!applyNow) {
-						ui.addNotification(null, E('p', _('Settings saved. The controller picks them up within one control interval.')));
-						return null;
-					}
-					return self.runApply().then(function() {
-						ui.addNotification(null, E('p', _('Cooling policy saved and applied.')));
-					});
-				});
-		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Failed to apply cooling policy:') + ' ' + (err && err.message ? err.message : err)), 'error');
-			throw err;
-		});
+		return null;
 	},
 
-	runApply: function() {
-		return fs.exec('/usr/sbin/h5000m-fancontrol', ['apply']).then(function(res) {
-			if (res && res.code !== 0)
-				throw new Error(res.stderr || _('controller returned an error'));
-			return res;
-		});
+	/* ------------------------------------------------------------- styling */
+
+	styleNode: function() {
+		/*
+		 * The root pins its own stacking context on purpose: a wide card that
+		 * filtered or transformed would create a layer above the theme's sticky
+		 * header and hide the navigation. Nothing here uses backdrop-filter.
+		 */
+		return E('style', { 'type': 'text/css' }, [ [
+			'.h5fan{position:relative;z-index:0;isolation:isolate;display:block;width:100%;',
+			'--h5fan-green:#2ea97a;--h5fan-blue:#3f8ad6;--h5fan-amber:#d9963f;--h5fan-red:#d65b5b;',
+			'--h5fan-line:rgba(127,127,127,.22);color:var(--text-color-high,#222)}',
+			'.h5fan *,.h5fan *:*{box-sizing:border-box}',
+			'.h5fan-card,.h5fan-panel,.h5fan-kv,.h5fan-node,.h5fan-banner,.h5fan-tabs{border:1px solid var(--h5fan-line);border-radius:12px;background:var(--background-color-high,#fff)}',
+			'.h5fan-head{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 12px}',
+			'.h5fan-head h2{margin:0;font-size:20px;line-height:1.25}',
+			'.h5fan-head-sub{margin:0;font-size:12.5px;color:var(--text-color-medium,#666);flex:1 1 100%}',
+			'.h5fan-health{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:600;background:rgba(46,169,122,.12);color:var(--h5fan-green)}',
+			'.h5fan-health:before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}',
+			'.h5fan-health.is-warn{background:rgba(217,150,63,.15);color:var(--h5fan-amber)}',
+			'.h5fan-health.is-fail{background:rgba(214,91,91,.15);color:var(--h5fan-red)}',
+			'.h5fan-head-actions{display:flex;flex-wrap:wrap;gap:7px;margin-left:auto}',
+			'.h5fan-banner{display:none;margin:0 0 12px;padding:11px 13px;font-size:12.5px;line-height:1.5;color:var(--h5fan-red);background:rgba(214,91,91,.08);border-left:3px solid var(--h5fan-red)}',
+			'.h5fan-banner.is-shown{display:block}',
+			'.h5fan-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px;padding:5px}',
+			'.h5fan-tab{position:relative;appearance:none;border:0;border-radius:9px;padding:8px 14px;font-size:13.5px;font-weight:600;color:var(--text-color-medium,#555);background:transparent;cursor:pointer;white-space:nowrap}',
+			'.h5fan-tab:hover{background:rgba(127,127,127,.1);color:var(--text-color-high,#222)}',
+			'.h5fan-tab[aria-selected="true"]{background:var(--h5fan-green);color:#fff}',
+			'.h5fan-tab:focus-visible{outline:2px solid var(--h5fan-blue);outline-offset:2px}',
+			'.h5fan-tab[data-dirty="1"]:after{content:"";position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--h5fan-amber)}',
+			'.h5fan-pane{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:14px;align-items:stretch;margin:0 0 14px}',
+			'.h5fan-pane[hidden]{display:none}',
+			'.h5fan-panel{padding:14px;display:flex;flex-direction:column;gap:12px;min-width:0}',
+			'.h5fan-panel h3,.h5fan-panel h4{margin:0;font-size:14px;font-weight:650}',
+			'.h5fan-panel-sub{margin:-6px 0 0;font-size:11.5px;line-height:1.5;color:var(--text-color-medium,#666)}',
+			'.h5fan-span12{grid-column:span 12}.h5fan-span8{grid-column:span 8}.h5fan-span7{grid-column:span 7}',
+			'.h5fan-span6{grid-column:span 6}.h5fan-span5{grid-column:span 5}.h5fan-span4{grid-column:span 4}',
+			'@media(max-width:1000px){.h5fan-span8,.h5fan-span7,.h5fan-span6,.h5fan-span5,.h5fan-span4{grid-column:span 12}}',
+			'@media(max-width:640px){.h5fan-pane{gap:10px}.h5fan-head-actions{margin-left:0;width:100%}.h5fan-head h2{font-size:18px}}',
+			'.h5fan-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:10px}',
+			'.h5fan-kv{padding:11px 12px;display:flex;flex-direction:column;gap:4px;min-width:0}',
+			'.h5fan-kv-label{font-size:11.5px;color:var(--text-color-medium,#666)}',
+			'.h5fan-kv-value{font-size:19px;font-weight:650;word-break:break-word}',
+			'.h5fan-kv-value.is-warn{color:var(--h5fan-amber)}.h5fan-kv-value.is-fail{color:var(--h5fan-red)}',
+			'.h5fan-kv-hint{font-size:11px;color:var(--text-color-low,#888);word-break:break-word}',
+			'.h5fan-badges{display:flex;flex-wrap:wrap;gap:7px}',
+			'.h5fan-badge{padding:4px 9px;border-radius:8px;font-size:11.5px;background:rgba(63,138,214,.12);color:var(--h5fan-blue)}',
+			'.h5fan-badge.is-warn{background:rgba(217,150,63,.15);color:var(--h5fan-amber)}',
+			'.h5fan-badge.is-fail{background:rgba(214,91,91,.15);color:var(--h5fan-red)}',
+			'.h5fan-tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:rgba(127,127,127,.13)}',
+			'.h5fan-tag.is-ok{background:rgba(46,169,122,.14);color:var(--h5fan-green)}',
+			'.h5fan-tag.is-warn{background:rgba(217,150,63,.16);color:var(--h5fan-amber)}',
+			'.h5fan-tag.is-fail{background:rgba(214,91,91,.16);color:var(--h5fan-red)}',
+			'.h5fan-rows{display:flex;flex-direction:column;gap:7px;margin:0}',
+			'.h5fan-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;font-size:12.5px;padding-bottom:6px;border-bottom:1px dashed rgba(127,127,127,.18)}',
+			'.h5fan-row:last-child{border-bottom:0;padding-bottom:0}',
+			'.h5fan-row-key{flex:1 1 42%;min-width:0;color:var(--text-color-medium,#666);word-break:break-word}',
+			'.h5fan-row-val{flex:1 1 50%;min-width:0;text-align:right;font-weight:600;word-break:break-word}',
+			'.h5fan-row-val.is-ok{color:var(--h5fan-green)}.h5fan-row-val.is-warn{color:var(--h5fan-amber)}.h5fan-row-val.is-fail{color:var(--h5fan-red)}',
+			'.h5fan-note{padding:10px 12px;font-size:12px;line-height:1.55;color:var(--text-color-medium,#555);background:rgba(63,138,214,.07);border-left:3px solid var(--h5fan-blue);border-radius:8px;margin:0}',
+			'.h5fan-note.is-warn{background:rgba(217,150,63,.1);border-left-color:var(--h5fan-amber)}',
+			'.h5fan-note.is-fail{background:rgba(214,91,91,.1);border-left-color:var(--h5fan-red)}',
+			'.h5fan-tablewrap{overflow-x:auto}',
+			'.h5fan-table{width:100%;border-collapse:collapse;font-size:12.5px}',
+			'.h5fan-table th,.h5fan-table td{padding:7px 8px;text-align:left;border-bottom:1px solid rgba(127,127,127,.15);vertical-align:top;word-break:break-word}',
+			'.h5fan-table th{font-weight:650;color:var(--text-color-medium,#666);white-space:nowrap}',
+			'.h5fan-table tr:last-child td{border-bottom:0}',
+			'.h5fan-fan{display:block;width:100%;max-width:212px;height:auto;margin:0 auto}',
+			'.h5fan-housing{fill:none;stroke:var(--h5fan-line);stroke-width:3}',
+			'.h5fan-shroud{fill:rgba(127,127,127,.06);stroke:none}',
+			'.h5fan-blade{fill:rgba(63,138,214,.45);stroke:rgba(63,138,214,.85);stroke-width:1.2}',
+			'.h5fan-hub{fill:var(--background-color-high,#fff);stroke:var(--h5fan-line);stroke-width:2}',
+			'.h5fan-fan-num{font-size:26px;font-weight:700;fill:var(--text-color-high,#222)}',
+			'.h5fan-fan-caption{font-size:12px;fill:var(--text-color-medium,#666)}',
+			'.h5fan-rotor{transform-origin:100px 100px}',
+			'.h5fan-fan.is-slow .h5fan-rotor{animation:h5fan-spin 5s linear infinite}',
+			'.h5fan-fan.is-medium .h5fan-rotor{animation:h5fan-spin 2.6s linear infinite}',
+			'.h5fan-fan.is-fast .h5fan-rotor{animation:h5fan-spin 1.4s linear infinite}',
+			'.h5fan-fan.is-stopped .h5fan-blade,.h5fan-fan.is-stopped .h5fan-hub{fill:rgba(127,127,127,.16);stroke:rgba(127,127,127,.45)}',
+			'.h5fan-fan.is-unknown .h5fan-blade{fill:rgba(127,127,127,.08);stroke:rgba(127,127,127,.3);stroke-dasharray:4 4}',
+			'.h5fan-fan.is-fault .h5fan-blade{fill:rgba(214,91,91,.3);stroke:var(--h5fan-red)}',
+			'.h5fan-fan.is-fault .h5fan-rotor{animation:h5fan-wobble 1.1s ease-in-out infinite}',
+			'@keyframes h5fan-spin{to{transform:rotate(360deg)}}',
+			'@keyframes h5fan-wobble{0%,100%{transform:rotate(-7deg)}50%{transform:rotate(7deg)}}',
+			'@media (prefers-reduced-motion:reduce){.h5fan .h5fan-rotor{animation:none!important}}',
+			'.h5fan-gauge{display:block;width:100%;max-width:132px;height:auto;margin:0 auto}',
+			'.h5fan-gauge-track{fill:none;stroke:rgba(127,127,127,.15);stroke-width:11}',
+			'.h5fan-gauge-value{fill:none;stroke:var(--h5fan-blue);stroke-width:11;stroke-linecap:round}',
+			'.h5fan-gauge-value.is-ok{stroke:var(--h5fan-green)}.h5fan-gauge-value.is-warn{stroke:var(--h5fan-amber)}.h5fan-gauge-value.is-fail{stroke:var(--h5fan-red)}',
+			'.h5fan-gauge-num{font-size:24px;font-weight:700;fill:var(--text-color-high,#222)}',
+			'.h5fan-gauge-unit{font-size:10px;fill:var(--text-color-medium,#666)}',
+			'.h5fan-chart{display:block;width:100%;height:auto}',
+			'.h5fan-grid-line{stroke:rgba(127,127,127,.13);stroke-width:1}',
+			'.h5fan-axis-line{stroke:rgba(127,127,127,.4);stroke-width:1.5}',
+			'.h5fan-tick{font-size:11px;fill:var(--text-color-medium,#666)}',
+			'.h5fan-axis-name{font-size:11px;fill:var(--text-color-low,#888)}',
+			'.h5fan-curve{fill:none;stroke:var(--h5fan-green);stroke-width:3;stroke-linejoin:round;stroke-linecap:round}',
+			'.h5fan-node-dot{fill:var(--background-color-high,#fff);stroke:var(--h5fan-green);stroke-width:2.5}',
+			'.h5fan-node-text{font-size:10.5px;fill:var(--text-color-medium,#666)}',
+			'.h5fan-floor{stroke:var(--h5fan-red);stroke-width:2;stroke-dasharray:7 5}',
+			'.h5fan-target{stroke:var(--h5fan-blue);stroke-width:2;stroke-dasharray:3 4}',
+			'.h5fan-cursor{stroke:rgba(63,138,214,.55);stroke-width:1.5}',
+			'.h5fan-marker{fill:#fff;stroke:var(--h5fan-blue);stroke-width:3}',
+			'.h5fan-marker-text{font-size:12px;font-weight:650;fill:var(--text-color-high,#222)}',
+			'.h5fan-chart-error{font-size:13px;fill:var(--h5fan-red)}',
+			'.h5fan-bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}',
+			'.h5fan-node{padding:10px 12px}',
+			'.h5fan-bar{display:block;width:100%;height:auto}',
+			'.h5fan-bar-track{fill:rgba(127,127,127,.12)}',
+			'.h5fan-bar-hatched{fill:none;stroke:rgba(127,127,127,.4);stroke-width:1;stroke-dasharray:4 4}',
+			'.h5fan-bar-fill{fill:var(--h5fan-green)}',
+			'.h5fan-bar-fill.is-watch{fill:var(--h5fan-amber)}.h5fan-bar-fill.is-hot{fill:#df6a3d}.h5fan-bar-fill.is-critical{fill:var(--h5fan-red)}',
+			'.h5fan-bar-fill.is-unknown,.h5fan-bar-fill.is-stale,.h5fan-bar-fill.is-bad{fill:rgba(127,127,127,.25)}',
+			'.h5fan-bar-name{font-size:12px;fill:var(--text-color-medium,#666)}',
+			'.h5fan-bar-value{font-size:13px;font-weight:700;fill:var(--text-color-high,#222)}',
+			'.h5fan-bar-note{font-size:10.5px;fill:var(--text-color-low,#888)}',
+			'.h5fan-bar-tick{stroke:rgba(127,127,127,.5);stroke-width:1}',
+			'.h5fan-fields{display:flex;flex-direction:column;gap:0}',
+			'.h5fan-field{display:grid;grid-template-columns:minmax(0,38%) minmax(0,62%);gap:10px;align-items:start;padding:10px 0;border-bottom:1px solid rgba(127,127,127,.13)}',
+			'.h5fan-field:last-child{border-bottom:0}',
+			'.h5fan-field-label{font-size:13px;font-weight:600;line-height:1.4}',
+			'.h5fan-field-label small{display:block;margin-top:3px;font-weight:400;font-size:11.5px;line-height:1.5;color:var(--text-color-medium,#666)}',
+			'.h5fan-field-body{display:flex;flex-direction:column;gap:6px;min-width:0}',
+			'.h5fan-field-body select,.h5fan-field-body input[type=text],.h5fan-field-body input[type=number]{width:100%;font-size:13px}',
+			'.h5fan-unit{font-size:11.5px;color:var(--text-color-low,#888)}',
+			'.h5fan-error{font-size:11.5px;color:var(--h5fan-red);min-height:15px}',
+			'@media(max-width:640px){.h5fan-field{grid-template-columns:minmax(0,100%);gap:6px}}',
+			'.h5fan-switch{display:inline-flex;align-items:center;gap:9px;cursor:pointer;font-size:13px}',
+			'.h5fan-switch input{position:absolute;opacity:0;pointer-events:none}',
+			'.h5fan-switch .h5fan-track{position:relative;width:46px;height:24px;border-radius:999px;background:rgba(127,127,127,.3);transition:background .15s ease;flex:0 0 auto}',
+			'.h5fan-switch .h5fan-track:after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .15s ease}',
+			'.h5fan-switch input:checked+.h5fan-track{background:var(--h5fan-green)}',
+			'.h5fan-switch input:checked+.h5fan-track:after{transform:translateX(22px)}',
+			'.h5fan-switch input:focus-visible+.h5fan-track{outline:2px solid var(--h5fan-blue);outline-offset:2px}',
+			'.h5fan-seg{display:flex;flex-wrap:wrap;gap:6px}',
+			'.h5fan-seg label{position:relative;padding:7px 12px;border:1px solid var(--h5fan-line);border-radius:9px;font-size:12.5px;cursor:pointer;background:var(--background-color-high,#fff)}',
+			'.h5fan-seg input{position:absolute;opacity:0;pointer-events:none}',
+			'.h5fan-seg label.is-on{background:var(--h5fan-blue);border-color:var(--h5fan-blue);color:#fff;font-weight:600}',
+			'.h5fan-slider{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+			'.h5fan-slider input[type=range]{flex:1 1 180px;min-width:140px}',
+			'.h5fan-slider input[type=number]{flex:0 0 auto;width:92px}',
+			'.h5fan-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}',
+			'.h5fan-nodes{display:flex;flex-direction:column;gap:7px}',
+			'.h5fan-noderow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;gap:8px;align-items:end}',
+			'.h5fan-noderow label{font-size:11px;color:var(--text-color-medium,#666)}',
+			'.h5fan-noderow input{width:100%}',
+			'.h5fan-empty{padding:14px;font-size:12.5px;color:var(--text-color-medium,#666);text-align:center}'
+		].join('') ]);
 	},
 
-	confirmation: function() {
-		var messages = Array.prototype.slice.call(arguments).filter(Boolean);
-		if (!messages.length)
-			return Promise.resolve(true);
-		return new Promise(function(resolve) {
-			ui.showModal(_('Please confirm'), [
-				E('div', { style: 'margin-bottom:12px;line-height:1.6' }, messages.map(function(m) { return E('p', m); })),
-				E('div', { class: 'right' }, [
-					E('button', {
-						class: 'btn',
-						click: function() { ui.hideModal(); resolve(false); }
-					}, _('Cancel')),
-					' ',
-					E('button', {
-						class: 'btn cbi-button-positive important',
-						click: function() { ui.hideModal(); resolve(true); }
-					}, _('Continue'))
-				])
-			]);
-		});
+	/* ------------------------------------------------------------- chrome */
+
+	head: function() {
+		var health = E('span', { 'class': 'h5fan-health' }, [ _('Loading…') ]);
+		var actions = E('div', { 'class': 'h5fan-head-actions' });
+
+		this.headHealth = health;
+
+		[
+			[ _('Save'), 'btn', L.bind(this.handleSave, this) ],
+			[ _('Save & Apply'), 'btn cbi-button-positive', L.bind(this.handleSaveApply, this) ],
+			[ _('Revert'), 'btn', L.bind(this.handleReset, this) ]
+		].forEach(L.bind(function(spec) {
+			actions.appendChild(E('button', {
+				'class': spec[1], type: 'button', click: spec[2]
+			}, [ spec[0] ]));
+		}, this));
+
+		return E('div', { 'class': 'h5fan-head' }, [
+			E('h2', {}, [ _('H5000M cooling management') ]),
+			health,
+			actions,
+			E('p', { 'class': 'h5fan-head-sub' }, [
+				_('Balances cooling against noise without touching the kernel CPU throttling, hot or critical protection.')
+			])
+		]);
 	},
 
-	/* ----------------------------------------------------------- *
-	 * tab navigation                                              *
-	 * ----------------------------------------------------------- */
-
-	tabList: function() {
-		return [
-			{ id: 'overview', title: _('Overview') },
-			{ id: 'control', title: _('Fan Control') },
-			{ id: 'curve', title: _('Fan Curve') },
-			{ id: 'monitor', title: _('Temperatures') },
-			{ id: 'settings', title: _('System Settings') },
-			{ id: 'diagnostics', title: _('Diagnostics') }
-		];
+	banner: function() {
+		this.bannerNode = E('div', { 'class': 'h5fan-banner', role: 'alert' }, [ '' ]);
+		return this.bannerNode;
 	},
 
-	selectTab: function(id, push) {
-		var tabs = this.tabList(), valid = false, i;
-		for (i = 0; i < tabs.length; i++)
-			if (tabs[i].id === id)
-				valid = true;
-		if (!valid)
-			id = 'overview';
-		this.activeTab = id;
-		var panels = document.querySelectorAll('.h5fc-panel-wrap');
-		for (i = 0; i < panels.length; i++)
-			panels[i].style.display = (panels[i].getAttribute('data-tab') === id) ? '' : 'none';
-		var buttons = document.querySelectorAll('.h5fc-tab');
-		for (i = 0; i < buttons.length; i++)
-			buttons[i].setAttribute('aria-selected', (buttons[i].getAttribute('data-tab') === id) ? 'true' : 'false');
-		try { window.sessionStorage.setItem('h5000m-fancontrol-tab', id); } catch (e) { }
-		if (push !== false && window.location.hash !== '#fan-' + id)
-			window.history.pushState(null, '', '#fan-' + id);
-		if (id === 'curve' && this.curveDrawn) {
-			this.curveDrawn = false;
-			this.drawCurveChart();
-		}
+	tabBar: function() {
+		var bar = E('div', { 'class': 'h5fan-tabs', role: 'tablist', 'aria-label': _('Sections') });
+
+		this.tabButtons = [];
+
+		TABS.forEach(L.bind(function(tab) {
+			var button = E('button', {
+				type: 'button', 'class': 'h5fan-tab', role: 'tab',
+				'data-h5tab': tab.id, 'aria-selected': 'false',
+				click: L.bind(function() {
+					this.selectTab(tab.id);
+				}, this)
+			}, [ _(tab.label) ]);
+
+			this.tabButtons.push({ id: tab.id, node: button });
+			bar.appendChild(button);
+		}, this));
+
+		return bar;
 	},
 
 	restoreTab: function() {
-		var id = null, m = /^#fan-([a-z]+)$/.exec(window.location.hash || '');
-		if (m)
-			id = m[1];
-		if (!id) {
-			try { id = window.sessionStorage.getItem('h5000m-fancontrol-tab'); } catch (e) { }
+		var hash = String(window.location.hash || '').replace('#', ''), stored;
+
+		if (TABS.some(function(tab) {
+			return tab.id === hash;
+		}))
+			return hash;
+
+		try {
+			stored = window.localStorage.getItem(TAB_KEY);
+		} catch (err) {
+			stored = null;
 		}
-		this.selectTab(id || 'overview', false);
+
+		return TABS.some(function(tab) {
+			return tab.id === stored;
+		}) ? stored : 'overview';
 	},
 
-	/* ----------------------------------------------------------- *
-	 * rendering                                                   *
-	 * ----------------------------------------------------------- */
+	selectTab: function(id, remember) {
+		this.tabId = TABS.some(function(tab) {
+			return tab.id === id;
+		}) ? id : 'overview';
 
-	render: function(data) {
-		var self = this;
-		this.status = data;
+		this.tabButtons.forEach(L.bind(function(tab) {
+			tab.node.setAttribute('aria-selected', tab.id === this.tabId ? 'true' : 'false');
+		}, this));
 
-		var root = E('div', { class: 'h5fc' }, [
-			E('style', { type: 'text/css' }, CSS),
-			E('div', { class: 'h5fc-hero' }, [
-				E('div', {}, [
-					E('h2', _('Cooling management')),
-					E('p', { class: 'h5fc-sub' }, _('Live fan policy, temperature sensors and kernel safety protection for the H5000M.'))
-				]),
-				E('div', { class: 'h5fc-health unknown', id: 'h5fc-health', title: '' }, _('Checking\u2026'))
+		TABS.forEach(L.bind(function(tab) {
+			var pane = this.panes[tab.id];
+
+			if (pane)
+				pane.hidden = tab.id !== this.tabId;
+		}, this));
+
+		if (remember === false)
+			return;
+
+		try {
+			window.localStorage.setItem(TAB_KEY, this.tabId);
+		} catch (err) {
+			/* Storage can be unavailable in private mode; the hash still works. */
+		}
+
+		if (window.location.hash !== '#%s'.format(this.tabId))
+			window.location.hash = '#%s'.format(this.tabId);
+	},
+
+	/* ------------------------------------------------------------ widgets */
+
+	field: function(key) {
+		var spec = OPTIONS[key], body = E('div', { 'class': 'h5fan-field-body' });
+		var wrap = E('div', { 'class': 'h5fan-field' }, [
+			E('div', { 'class': 'h5fan-field-label' }, [
+				_(spec.label),
+				E('small', {}, [ _(spec.hint) ])
 			]),
-			E('div', { class: 'h5fc-conn-lost', id: 'h5fc-conn-lost' },
-				_('Cannot read controller status. Check that the h5000m-fancontrol service is installed and running.')),
-			this.renderTabStrip(),
-			E('div', { id: 'h5fc-panels' }, [
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'overview' }, this.renderOverview()),
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'control' }, this.renderControl()),
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'curve' }, this.renderCurveTab()),
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'monitor' }, this.renderMonitor()),
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'settings' }, this.renderSettings()),
-				E('div', { class: 'h5fc-panel-wrap', 'data-tab': 'diagnostics' }, this.renderDiagnostics())
+			body
+		]);
+
+		this.widgetInput = this.widgetInput || {};
+		this.widgetError = this.widgetError || {};
+
+		if (spec.kind === 'switch') {
+			var checkbox = E('input', {
+				type: 'checkbox', checked: this.values[key] === '1'
+			});
+
+			checkbox.addEventListener('change', L.bind(function(ev) {
+				this.values[key] = ev.target.checked ? '1' : '0';
+				this.afterChange(key);
+			}, this));
+
+			body.appendChild(E('label', { 'class': 'h5fan-switch' }, [
+				checkbox, E('i', { 'class': 'h5fan-track' }), E('span', {}, [ _('Enabled') ])
+			]));
+			this.widgetInput[key] = checkbox;
+		} else if (spec.kind === 'select') {
+			var select = E('select', { 'class': 'cbi-dropdown' });
+
+			spec.choices.forEach(function(choice) {
+				var option = E('option', { value: choice[0] }, [ _(choice[1]) ]);
+
+				if (choice[0] === this.values[key])
+					option.selected = true;
+
+				select.appendChild(option);
+			}, this);
+
+			select.addEventListener('change', L.bind(function(ev) {
+				this.values[key] = ev.target.value;
+				this.afterChange(key);
+			}, this));
+
+			body.appendChild(select);
+			this.widgetInput[key] = select;
+		} else if (spec.kind === 'slider') {
+			var range = E('input', {
+				type: 'range', min: String(spec.min), max: String(spec.max), step: '1',
+				value: String(this.values[key])
+			});
+			var box = E('input', {
+				type: 'number', 'class': 'cbi-input-text', min: String(spec.min),
+				max: String(spec.max), step: '1', value: String(this.values[key])
+			});
+
+			function sync(from, to) {
+				from.addEventListener('input', L.bind(function(ev) {
+					var value = ev.target.value;
+					this.values[key] = value;
+					to.value = value;
+					this.afterChange(key);
+				}, this));
+			}
+
+			sync(range, box);
+			sync(box, range);
+
+			body.appendChild(E('div', { 'class': 'h5fan-slider' }, [ range, box ]));
+			body.appendChild(E('span', { 'class': 'h5fan-unit' }, [ _('0 is stopped, 255 is full speed.') ]));
+			this.widgetInput[key] = box;
+			this.widgetRange = this.widgetRange || {};
+			this.widgetRange[key] = range;
+		} else {
+			var input = E('input', {
+				type: 'text', 'class': 'cbi-input-text', value: String(this.values[key])
+			});
+
+			input.addEventListener('input', L.bind(function(ev) {
+				this.values[key] = ev.target.value;
+				this.afterChange(key);
+			}, this));
+
+			body.appendChild(input);
+
+			if (spec.unit)
+				body.appendChild(E('span', { 'class': 'h5fan-unit' }, [ _('Allowed') + ': ' + spec.unit ]));
+
+			this.widgetInput[key] = input;
+		}
+
+		if (spec.kind === 'curve') {
+			body.appendChild(E('div', { 'class': 'h5fan-note is-warn', hidden: true }, [ '' ]));
+			this.widgetError[key] = body.lastChild;
+		}
+
+		this.fields = this.fields || {};
+		this.fields[key] = wrap;
+		return wrap;
+	},
+
+	afterChange: function(key) {
+		this.validateOption(key, true);
+		this.markDirty();
+
+		if (key === 'curve_custom' || key === 'curve')
+			this.syncCurvePreview();
+
+		if (key === 'manual_pwm' || key === 'mode')
+			this.paintLiveState();
+	},
+
+	validateOption: function(key, show) {
+		var spec = OPTIONS[key], value = this.values[key], message = null;
+
+		if (spec.kind === 'switch')
+			message = (value === '0' || value === '1') ? null : _('Choose enabled or disabled.');
+		else if (spec.kind === 'select')
+			message = spec.choices.some(function(choice) {
+				return choice[0] === value;
+			}) ? null : _('Pick one of the listed values.');
+		else if (spec.kind === 'curve')
+			message = parseCurve(value).error;
+		else {
+			var parsed = num(value);
+
+			if (parsed === null || String(parsed) !== String(value).trim() || parsed < spec.min || parsed > spec.max)
+				message = _('%1$s must be a whole number between %2$s and %3$s.').format(_(spec.label), spec.min, spec.max);
+		}
+
+		if (show !== false && this.widgetError && this.widgetError[key]) {
+			this.widgetError[key].hidden = !message;
+			this.widgetError[key].textContent = message || '';
+		}
+
+		if (show !== false && this.widgetInput && this.widgetInput[key])
+			this.widgetInput[key].setAttribute('aria-invalid', message ? 'true' : 'false');
+
+		return message;
+	},
+
+	validateAll: function() {
+		var problems = [], key;
+
+		for (key in OPTIONS) {
+			var message = this.validateOption(key, true);
+
+			if (message)
+				problems.push('%s: %s'.format(_(OPTIONS[key].label), message));
+		}
+
+		return problems;
+	},
+
+	markDirty: function() {
+		var dirtyKeys = this.dirtyKeys(), byTab = {}, key;
+
+		TABS.forEach(function(tab) {
+			byTab[tab.id] = false;
+		});
+
+		for (key in OPTIONS) {
+			if (this.values[key] !== this.original[key])
+				byTab[OPTIONS[key].tab] = true;
+		}
+
+		this.tabButtons.forEach(function(tab) {
+			tab.node.setAttribute('data-dirty', byTab[tab.id] ? '1' : '0');
+		});
+
+		this.dirty = dirtyKeys;
+	},
+
+	dirtyKeys: function() {
+		var keys = [], key;
+
+		for (key in OPTIONS) {
+			if (this.values[key] !== this.original[key])
+				keys.push(key);
+		}
+
+		return keys;
+	},
+
+	/* --------------------------------------------------------------- panes */
+
+	buildPanes: function() {
+		this.panes = {};
+
+		TABS.forEach(L.bind(function(tab) {
+			this.panes[tab.id] = E('div', { 'class': 'h5fan-pane', 'data-h5tab': tab.id, hidden: true });
+		}, this));
+
+		this.charts = {
+			fan: mountFanDiagram(),
+			output: mountGauge('Applied output'),
+			target: mountGauge('Target output'),
+			curve: mountCurveChart()
+		};
+
+		this.buildOverview();
+		this.buildControl();
+		this.buildCurve();
+		this.buildMonitor();
+		this.buildSystem();
+		this.buildDiagnostics();
+
+		return TABS.map(L.bind(function(tab) {
+			return this.panes[tab.id];
+		}, this));
+	},
+
+	buildOverview: function() {
+		var pane = this.panes.overview, stats = {};
+
+		this.stats = stats;
+
+		[
+			[ 'reason', _('Control reason') ],
+			[ 'control', _('Control temperature') ],
+			[ 'requested', _('Requested') ],
+			[ 'target', _('Target') ],
+			[ 'actual', _('Register readback') ],
+			[ 'floor', _('Kernel floor') ],
+			[ 'rpm', _('Tachometer') ]
+		].forEach(function(spec) {
+			var value = E('div', { 'class': 'h5fan-kv-value' }, [ '\u2014' ]);
+			var hint = E('div', { 'class': 'h5fan-kv-hint' }, [ '' ]);
+
+			stats[spec[0]] = {
+				value: value, hint: hint,
+				set: function(text, note, tone) {
+					value.textContent = text;
+					value.className = 'h5fan-kv-value%s'.format(tone ? ' is-%s'.format(tone) : '');
+					hint.textContent = note || '';
+				}
+			};
+
+			stats[spec[0]].node = E('div', { 'class': 'h5fan-kv' }, [
+				E('div', { 'class': 'h5fan-kv-label' }, [ spec[1] ]), value, hint
+			]);
+		});
+
+		this.overviewBadges = E('div', { 'class': 'h5fan-badges' });
+		this.overviewRows = E('div', { 'class': 'h5fan-rows' });
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span4' }, [
+			E('h3', {}, [ _('Fan') ]),
+			this.charts.fan,
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('Schematic only. The animation follows the applied output, it is not a measured speed.')
+			])
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
+			E('h3', {}, [ _('Outputs') ]),
+			E('div', { 'class': 'h5fan-bars' }, [
+				E('div', { 'class': 'h5fan-node' }, [ this.charts.output ]),
+				E('div', { 'class': 'h5fan-node' }, [ this.charts.target ])
+			]),
+			E('div', { 'class': 'h5fan-stats' }, [
+				stats.requested.node, stats.actual.node, stats.floor.node, stats.rpm.node
+			])
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span3' }, [
+			E('h3', {}, [ _('Status') ]),
+			this.overviewBadges,
+			this.overviewRows
+		]));
+
+		this.overviewBars = this.mountBars(E('div', { 'class': 'h5fan-bars' }));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span12' }, [
+			E('h3', {}, [ _('Temperatures') ]),
+			E('div', { 'class': 'h5fan-stats' }, [
+				stats.control.node, stats.reason.node
+			]),
+			this.overviewBars
+		]));
+	},
+
+	/*
+	 * Each pane needs its own chart instances: a DOM node can only live in one
+	 * parent, so sharing one between the overview and the monitor tab would
+	 * silently move it out of the first panel.
+	 */
+	mountBars: function(container) {
+		this.allBars = this.allBars || [];
+
+		SENSOR_SLOTS.forEach(L.bind(function(slot) {
+			var chart = mountTempBar(slot);
+
+			this.allBars.push({ id: slot.id, chart: chart });
+			container.appendChild(E('div', { 'class': 'h5fan-node' }, [ chart ]));
+		}, this));
+
+		return container;
+	},
+
+	buildControl: function() {
+		var pane = this.panes.control, fields = E('div', { 'class': 'h5fan-fields' });
+
+		[ 'enabled', 'mode', 'curve', 'manual_pwm', 'start_pwm', 'start_boost_ms' ].forEach(L.bind(function(key) {
+			fields.appendChild(this.field(key));
+		}, this));
+
+		this.controlRows = E('div', { 'class': 'h5fan-rows' });
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Fan control') ]), fields
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Live output') ]),
+			this.controlRows,
+			E('div', { 'class': 'h5fan-actions' }, [
+				E('button', {
+					'class': 'btn cbi-button-positive', type: 'button',
+					click: L.bind(this.runApply, this)
+				}, [ _('Apply now') ]),
+				E('button', {
+					'class': 'btn', type: 'button',
+					click: L.bind(this.refresh, this)
+				}, [ _('Refresh') ]),
+				E('button', {
+					'class': 'btn cbi-button-negative', type: 'button',
+					click: L.bind(this.confirmRestart, this)
+				}, [ _('Restart service') ])
+			]),
+			E('p', { 'class': 'h5fan-note' }, [
+				_('Apply runs one control cycle immediately. The controller reloads its configuration by itself, so saving never restarts the service.')
+			])
+		]));
+	},
+
+	buildCurve: function() {
+		var pane = this.panes.curve;
+
+		this.curveLegend = E('div', { 'class': 'h5fan-badges' }, [
+			E('span', { 'class': 'h5fan-badge' }, [ _('Solid green: the control function') ]),
+			E('span', { 'class': 'h5fan-badge is-fail' }, [ _('Red dashed: kernel safety floor') ]),
+			E('span', { 'class': 'h5fan-badge' }, [ _('Blue dashed: target output') ]),
+			E('span', { 'class': 'h5fan-badge' }, [ _('Marker: current control temperature') ])
+		]);
+
+		this.nodeList = E('div', { 'class': 'h5fan-nodes' });
+		this.nodeError = E('div', { 'class': 'h5fan-error' }, [ '' ]);
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span7' }, [
+			E('h3', {}, [ _('Effective curve') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('The line is sampled once per degree with the same integer arithmetic the controller uses.')
+			]),
+			this.charts.curve,
+			this.curveLegend
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
+			E('h3', {}, [ _('Custom curve points') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('Editing here only changes the page. Use Save to store it, and the chart updates live.')
+			]),
+			E('div', { 'class': 'h5fan-seg', id: 'h5fan-preset-seg' }),
+			this.nodeList,
+			this.nodeError,
+			E('div', { 'class': 'h5fan-actions' }, [
+				E('button', {
+					'class': 'btn', type: 'button', click: L.bind(function() {
+						this.editorPoints.push({ temp: 25, percent: 0 });
+						this.renderNodes();
+					}, this)
+				}, [ _('Add point') ]),
+				E('button', {
+					'class': 'btn cbi-button-negative', type: 'button', click: L.bind(function() {
+						if (this.editorPoints.length > 2) {
+							this.editorPoints.pop();
+							this.renderNodes();
+						}
+					}, this)
+				}, [ _('Remove last') ]),
+				E('button', {
+					'class': 'btn', type: 'button', click: L.bind(function() {
+						this.resetCustomCurve();
+					}, this)
+				}, [ _('Restore default curve') ])
+			]),
+			E('p', { 'class': 'h5fan-note' }, [
+				_('Temperatures must rise strictly and percentages stay within 0-100%. An invalid curve makes the controller run its failsafe output instead of stopping the fan.')
+			])
+		]));
+	},
+
+	buildMonitor: function() {
+		var pane = this.panes.monitor;
+
+		this.monitorTable = E('table', { 'class': 'h5fan-table' }, [
+			E('tr', {}, [
+				E('th', {}, [ _('Sensor') ]), E('th', {}, [ _('Value') ]), E('th', {}, [ _('State') ]),
+				E('th', {}, [ _('Source') ]), E('th', {}, [ _('Updated') ]), E('th', {}, [ _('Detail') ])
 			])
 		]);
 
-		window.addEventListener('hashchange', function() {
-			var m = /^#fan-([a-z]+)$/.exec(window.location.hash || '');
-			if (m && m[1] !== self.activeTab)
-				self.selectTab(m[1], false);
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span12' }, [
+			E('h3', {}, [ _('Temperature monitor') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('Native thermal and hwmon readings win; the vendor radio query is only a bounded fallback. The colour bands are this project’s own reference ranges, not a vendor specification.')
+			]),
+			this.mountBars(E('div', { 'class': 'h5fan-bars' })),
+			E('div', { 'class': 'h5fan-tablewrap' }, [ this.monitorTable ])
+		]));
+	},
+
+	buildSystem: function() {
+		var pane = this.panes.system, fields = E('div', { 'class': 'h5fan-fields' });
+
+		[ 'temp_source', 'interval', 'hysteresis', 'down_delay', 'fail_pwm',
+			'curve_silent', 'curve_balanced', 'curve_performance' ].forEach(L.bind(function(key) {
+			fields.appendChild(this.field(key));
+		}, this));
+
+		this.systemRows = E('div', { 'class': 'h5fan-rows' });
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span7' }, [
+			E('h3', {}, [ _('Sampling and safety') ]), fields
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
+			E('h3', {}, [ _('Effective values') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('What the controller is using right now, after validation and clamping.')
+			]),
+			this.systemRows,
+			E('div', { 'class': 'h5fan-actions' }, [
+				E('button', {
+					'class': 'btn cbi-button-negative', type: 'button',
+					click: L.bind(this.confirmFactoryDefaults, this)
+				}, [ _('Restore all defaults') ])
+			])
+		]));
+	},
+
+	buildDiagnostics: function() {
+		var pane = this.panes.diagnostics;
+
+		this.diagRows = E('div', { 'class': 'h5fan-rows' });
+		this.protectRows = E('div', { 'class': 'h5fan-rows' });
+		this.issueBox = E('div', {}, [ E('p', { 'class': 'h5fan-empty' }, [ _('Loading…') ]) ]);
+		this.eventTable = E('table', { 'class': 'h5fan-table' }, [
+			E('tr', {}, [
+				E('th', {}, [ _('Time') ]), E('th', {}, [ _('Level') ]),
+				E('th', {}, [ _('Code') ]), E('th', {}, [ _('Message') ])
+			])
+		]);
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Controller') ]), this.diagRows
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Kernel protection') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('Read-only view of the thermal zone, its governor and the trip points the firmware declares.')
+			]),
+			this.protectRows
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Configuration check') ]),
+			E('p', { 'class': 'h5fan-panel-sub' }, [
+				_('Corrections the controller applied while reading the configuration file.')
+			]),
+			this.issueBox
+		]));
+
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+			E('h3', {}, [ _('Recent events') ]),
+			E('div', { 'class': 'h5fan-tablewrap' }, [ this.eventTable ])
+		]));
+	},
+
+	/* -------------------------------------------------------------- render */
+
+	render: function() {
+		var root = E('div', { 'class': 'h5fan' });
+
+		this.editorPoints = [];
+
+		root.appendChild(this.styleNode());
+		root.appendChild(this.head());
+		root.appendChild(this.banner());
+		root.appendChild(this.tabBar());
+		this.buildPanes().forEach(function(pane) {
+			root.appendChild(pane);
 		});
 
-		/* LuCI inserts the returned node after render() resolves, so all
-		 * getElementById-based widget wiring has to run one tick later. */
-		window.setTimeout(L.bind(function() {
-			this.restoreTab();
-			this.wireManualSlider();
-			this.wireChartClick();
-			this.rebuildStaticWidgets();
-			this.updateStatus(this.status || data);
-		}, this), 0);
+		this.tabId = this.restoreTab();
+		this.selectTab(this.tabId, false);
+		this.markDirty();
+		this.paint();
+
+		window.addEventListener('hashchange', L.bind(function() {
+			this.selectTab(this.restoreTab(), false);
+		}, this));
 
 		poll.add(L.bind(function() {
-			return this.fetchStatus().then(L.bind(function(next) {
-				this.status = next;
-				this.updateStatus(next);
+			return this.refresh().then(L.bind(function() {
+				/* Keep unsaved edits visible: only refresh non-dirty fields. */
+				this.restoreWidgetValues();
 			}, this));
-		}, this), 3);
+		}, this), REFRESH_SECONDS);
 
 		return root;
 	},
 
-	renderTabStrip: function() {
-		var self = this;
-		return E('div', { class: 'h5fc-tabs', role: 'tablist' }, this.tabList().map(function(tab) {
-			return E('button', {
-				class: 'h5fc-tab',
-				'data-tab': tab.id,
-				role: 'tab',
-				type: 'button',
-				'aria-selected': 'false',
-				click: function() { self.selectTab(tab.id); }
-			}, [ E('span', { class: 'h5fc-dot' }), tab.title ]);
-		}));
-	},
+	restoreWidgetValues: function() {
+		var key;
 
-	/* ---- shared small builders ---- */
-
-	card: function(id, title, opts) {
-		opts = opts || {};
-		return E('div', { class: 'h5fc-card' + (opts.accent ? ' accent' : '') }, [
-			E('div', { class: 'h5fc-card-title' }, title),
-			E('div', { class: 'h5fc-big', id: id + '-value' }, opts.initial || '\u2026'),
-			E('div', { class: 'h5fc-hint', id: id + '-hint' }, '')
-		]);
-	},
-
-	chip: function(id, label) {
-		return E('span', { class: 'h5fc-chip', id: id }, [ label + ' ', E('b', { id: id + '-v' }, '\u2014') ]);
-	},
-
-	field: function(label, description, body, err) {
-		return E('div', { class: 'h5fc-field' }, [
-			E('div', { class: 'h5fc-label' }, [ label, description ? E('small', {}, description) : '' ]),
-			body,
-			E('div', { class: 'h5fc-err' }, err || '')
-		]);
-	},
-
-	/* ---- overview tab ---- */
-
-	renderOverview: function() {
-		return E('div', {}, [
-			E('div', { class: 'h5fc-overview' }, [
-				E('div', { class: 'h5fc-card h5fc-fanbox', id: 'h5fc-fanbox' }, [ this.fanSvg() ]),
-				E('div', { class: 'h5fc-grid', style: 'grid-template-columns:1fr;align-content:start' }, [
-					E('div', { class: 'h5fc-grid c4' }, [
-						this.card('h5fc-ov-mode', _('Operating mode')),
-						this.card('h5fc-ov-target', _('Target output')),
-						this.card('h5fc-ov-applied', _('Actual output')),
-						this.card('h5fc-ov-control', _('Control temperature'))
-					]),
-					E('div', { class: 'h5fc-card' }, [
-						E('div', { class: 'h5fc-card-title' }, _('Safety protection')),
-						E('div', { class: 'h5fc-chips' }, [
-							this.chip('h5fc-ch-health', _('Controller')),
-							this.chip('h5fc-ch-floor', _('Kernel safety floor')),
-							this.chip('h5fc-ch-delay', _('Speed-down delay')),
-							this.chip('h5fc-ch-owner', _('Fan ownership')),
-							this.chip('h5fc-ch-rpm', _('Fan speed'))
-						])
-					]),
-					E('div', { class: 'h5fc-card' }, [
-						E('div', { class: 'h5fc-card-title' }, _('Temperatures')),
-						E('div', { class: 'h5fc-grid c4', style: 'margin:0' }, [
-							this.card('h5fc-ov-cpu', _('CPU')),
-							this.card('h5fc-ov-phy', _('Ethernet PHY')),
-							this.card('h5fc-ov-wifi', _('Wi-Fi radios')),
-							this.card('h5fc-ov-modem', _('5G modem'))
-						])
-					])
-				])
-			]),
-			E('div', { class: 'h5fc-note', id: 'h5fc-ov-note' }, '')
-		]);
-	},
-
-	fanSvg: function() {
-		/* Decorative fan illustration. The rotation speed is NOT a
-		 * measurement of the real RPM - it only signals that the fan is
-		 * being driven. */
-		var blades = [], i, a;
-		for (i = 0; i < 7; i++) {
-			a = (360 / 7) * i;
-			blades.push(svgEl('path', {
-				d: 'M100 100 C 90 78, 96 52, 118 40 C 122 58, 118 80, 106 98 Z',
-				fill: 'currentColor',
-				opacity: '.92',
-				transform: 'rotate(%d 100 100)'.format(a)
-			}));
+		for (key in OPTIONS) {
+			if (this.values[key] === this.original[key] && this.widgetInput[key]) {
+				if (OPTIONS[key].kind === 'switch')
+					this.widgetInput[key].checked = this.values[key] === '1';
+				else
+					this.widgetInput[key].value = this.values[key];
+			}
 		}
-		var svg = svgEl('svg', {
-			viewBox: '0 0 200 226',
-			width: '180', height: '203',
-			role: 'img',
-			id: 'h5fc-fan-svg',
-			'aria-label': _('Fan status illustration')
-		});
-		svg.appendChild(svgEl('circle', { cx: 100, cy: 100, r: 92, fill: 'none', stroke: 'currentColor', 'stroke-width': 3, opacity: .25 }));
-		svg.appendChild(svgEl('circle', { cx: 100, cy: 100, r: 84, fill: 'none', stroke: 'currentColor', 'stroke-width': 6, opacity: .12, id: 'h5fc-fan-ring' }));
-		var g = svgEl('g', { class: 'h5fc-fan-blades', id: 'h5fc-fan-blades' });
-		blades.forEach(function(b) { g.appendChild(b); });
-		svg.appendChild(g);
-		svg.appendChild(svgEl('circle', { cx: 100, cy: 100, r: 22, fill: 'currentColor', opacity: .95 }));
-		svg.appendChild(svgEl('circle', { cx: 100, cy: 100, r: 8, fill: '#fff', opacity: .9 }));
-		svg.appendChild(svgEl('text', { x: 100, y: 214, 'text-anchor': 'middle', 'font-size': 17, 'font-weight': 700, fill: 'currentColor', id: 'h5fc-fan-label' }, '\u2014'));
-		return svg;
 	},
 
-	/* ---- control tab ---- */
-
-	renderControl: function() {
-		var self = this;
-
-		var enabledSwitch = E('label', { class: 'h5fc-switch' }, [
-			E('input', {
-				type: 'checkbox', id: 'h5fc-enabled',
-				change: function(ev) {
-					self.setValue('enabled', ev.target.checked ? '1' : '0');
-					self.updateModeVisibility();
-				}
-			}),
-			E('i', {})
-		]);
-
-		var modeSeg = this.segmented('h5fc-mode', 'mode', [
-			['auto', _('Automatic')],
-			['manual', _('Manual')],
-			['kernel', _('Kernel protection only')]
-		]);
-
-		var sourceSeg = this.segmented('h5fc-source', 'temp_source', [
-			['max', _('Hottest sensor')],
-			['cpu', _('CPU only')]
-		]);
-
-		var manualSlider = E('div', { class: 'h5fc-slider', id: 'h5fc-manual-row' }, [
-			E('input', { type: 'range', min: 0, max: 255, step: 1, id: 'h5fc-manual-range' }),
-			E('input', { type: 'number', min: 0, max: 255, step: 1, class: 'h5fc-input', id: 'h5fc-manual-number' })
-		]);
-
-		return E('div', {}, [
-			E('div', { class: 'h5fc-panel' }, [
-				E('div', { class: 'h5fc-panel-head' }, [
-					E('h3', _('Fan control')),
-					E('span', { class: 'h5fc-badge', id: 'h5fc-ctl-live' }, '\u2014')
-				]),
-				E('div', { class: 'h5fc-grid c2' }, [
-					this.field(_('Enable enhanced controller'),
-						_('When disabled, the fan follows the kernel thermal protection level only.'),
-						enabledSwitch),
-					this.field(_('Operating mode'),
-						_('Automatic follows the fan curve; Manual drives a fixed PWM; Kernel protection only leaves the fan to the kernel governor.'),
-						modeSeg)
-				]),
-				E('div', { class: 'h5fc-grid c2' }, [
-					this.field(_('Control temperature'),
-						_('Hottest sensor considers CPU, Ethernet PHY, Wi-Fi radios and the 5G modem cache.'),
-						sourceSeg, '', 'h5fc-source-field'),
-					this.field(_('Manual PWM output'),
-						_('Applied in manual mode. The kernel safety floor may raise the effective output above this value.'),
-						manualSlider)
-				])
-			]),
-			E('div', { class: 'h5fc-panel' }, [
-				E('div', { class: 'h5fc-panel-head' }, [ E('h3', _('Live output')), E('span', {}) ]),
-				E('div', { class: 'h5fc-grid c4' }, [
-					this.card('h5fc-ctl-requested', _('Requested output')),
-					this.card('h5fc-ctl-target', _('Target output')),
-					this.card('h5fc-ctl-applied', _('Actual output')),
-					this.card('h5fc-ctl-reason', _('Control reason'))
-				]),
-				E('div', { style: 'display:flex;gap:10px;margin-top:14px;flex-wrap:wrap' }, [
-					E('button', {
-						class: 'h5fc-btn primary', type: 'button',
-						click: function() {
-							self.runApply().then(function() {
-								ui.addNotification(null, E('p', _('Control cycle executed.')));
-							}, function(err) {
-								ui.addNotification(null, E('p', _('Control cycle failed:') + ' ' + (err.message || err)), 'error');
-							});
-						}
-					}, _('Run control cycle now')),
-					E('button', {
-						class: 'h5fc-btn', type: 'button',
-						click: function() {
-							self.confirmation(_('Restart the fan control service? The fan keeps its current output during the restart.')).then(function(ok) {
-								if (!ok)
-									return;
-								return fs.exec('/etc/init.d/h5000m-fancontrol', ['restart']).then(function() {
-									ui.addNotification(null, E('p', _('Service restarted.')));
-								}, function(err) {
-									ui.addNotification(null, E('p', _('Service restart failed:') + ' ' + (err.message || err)), 'error');
-								});
-							});
-						}
-					}, _('Restart service'))
-				])
-			])
-		]);
+	refresh: function() {
+		return this.fetchStatus().then(L.bind(function() {
+			this.paint();
+		}, this));
 	},
 
-	segmented: function(id, key, options) {
-		var self = this;
-		return E('div', { class: 'h5fc-seg', id: id, role: 'radiogroup' }, options.map(function(opt) {
-			var label = E('label', {}, [
-				E('input', {
-					type: 'radio', name: id, value: opt[0],
-					change: function(ev) {
-						if (ev.target.checked) {
-							self.setValue(key, opt[0]);
-							if (key === 'curve')
-								self.onCurveProfileChange();
-						}
-					}
-				}),
-				E('span', {}, opt[1])
-			]);
-			return label;
-		}));
-	},
+	/* --------------------------------------------------------------- paint */
 
-	/* ---- curve tab ---- */
-
-	renderCurveTab: function() {
-		var self = this;
-
-		var profileSeg = this.segmented('h5fc-curve-profile', 'curve', [
-			['silent', _('Quiet')],
-			['balanced', _('Balanced')],
-			['performance', _('Performance')],
-			['custom', _('Custom')]
-		]);
-
-		var chartCard = E('div', { class: 'h5fc-curve-svg-wrap' }, [
-			svgEl('svg', { class: 'h5fc-curve-svg', id: 'h5fc-curve-svg', viewBox: '0 0 680 340', role: 'img' })
-		]);
-
-		this.curveEditorBuilt = false;
-
-		var editorCard = E('div', { class: 'h5fc-card', id: 'h5fc-curve-editor' }, [
-			E('div', { class: 'h5fc-card-title' }, _('Custom curve nodes')),
-			E('div', { class: 'h5fc-hint', style: 'white-space:normal;margin:0 0 10px' },
-				_('Drag the dots in the chart or edit the table. Click an empty spot to add a node; double-click a node to remove it.')),
-			E('div', { class: 'h5fc-nodes', id: 'h5fc-curve-nodes' }),
-			E('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap' }, [
-				E('button', {
-					class: 'h5fc-btn', type: 'button',
-					click: function() { self.addCurveNode(); }
-				}, _('Add node')),
-				E('button', {
-					class: 'h5fc-btn danger', type: 'button',
-					click: function() {
-						self.confirmation(_('Restore the default custom curve? Your current custom points will be replaced.')).then(function(ok) {
-							if (!ok)
-								return;
-							self.setValue('curve_custom', OPTIONS.curve_custom.def);
-							self.rebuildCurveEditor();
-						});
-					}
-				}, _('Restore default'))
-			])
-		]);
-
-		return E('div', { class: 'h5fc-panel' }, [
-			E('div', { class: 'h5fc-panel-head' }, [
-				E('h3', _('Fan curve')),
-				profileSeg
-			]),
-			E('div', { class: 'h5fc-curve-layout' }, [
-				chartCard,
-				E('div', { style: 'display:grid;gap:12px' }, [
-					E('div', { class: 'h5fc-grid c2', style: 'margin:0' }, [
-						this.card('h5fc-curve-now', _('Operating point')),
-						this.card('h5fc-curve-floor', _('Kernel floor'))
-					]),
-					editorCard
-				])
-			]),
-			E('div', { class: 'h5fc-note', id: 'h5fc-curve-note' }, '')
-		]);
-	},
-
-	onCurveProfileChange: function() {
-		var editable = this.values.curve === 'custom';
-		var editor = document.getElementById('h5fc-curve-editor');
-		if (editor)
-			editor.style.opacity = editable ? '1' : '.45';
-		this.rebuildCurveEditor();
-	},
-
-	customPoints: function() {
-		return parseCurve(this.values.curve_custom) || [];
-	},
-
-	syncCurveValue: function(points) {
-		this.values.curve_custom = points.map(function(p) { return p.temp + ':' + p.percent; }).join(',');
-		this.updateDirtyDots();
-	},
-
-	rebuildCurveEditor: function() {
-		var self = this, holder = document.getElementById('h5fc-curve-nodes');
-		if (!holder)
+	paint: function() {
+		if (!this.status) {
+			this.paintError();
 			return;
-		var points = this.customPoints();
-		holder.style.display = (this.values.curve === 'custom') ? '' : 'none';
-		while (holder.firstChild)
-			holder.removeChild(holder.firstChild);
-		points.forEach(function(point, index) {
-			var tInput = E('input', { type: 'number', min: 0, max: 150, step: 1, class: 'h5fc-input', value: point.temp });
-			var pInput = E('input', { type: 'number', min: 0, max: 100, step: 1, class: 'h5fc-input', value: point.percent });
-			var apply = function() {
-				var pts = self.customPoints();
-				if (!pts[index])
-					return;
-				pts[index] = { temp: clamp(parseInt(tInput.value, 10) || 0, 0, 150), percent: clamp(parseInt(pInput.value, 10) || 0, 0, 100) };
-				var sorted = pts.slice().sort(function(a, b) { return a.temp - b.temp; });
-				var ok = parseCurve(sorted.map(function(p) { return p.temp + ':' + p.percent; }).join(','));
-				if (!ok) {
-					tInput.classList.add('err');
-					pInput.classList.add('err');
-					return;
-				}
-				tInput.classList.remove('err');
-				pInput.classList.remove('err');
-				self.syncCurveValue(sorted);
-				self.rebuildCurveEditor();
-				self.drawCurveChart();
-			};
-			tInput.addEventListener('change', apply);
-			pInput.addEventListener('change', apply);
-			var del = E('button', { type: 'button', title: _('Delete node') }, '\u00d7');
-			if (points.length <= 2)
-				del.disabled = true;
-			del.addEventListener('click', function() {
-				var pts = self.customPoints();
-				if (pts.length > 2) {
-					pts.splice(index, 1);
-					self.syncCurveValue(pts);
-					self.rebuildCurveEditor();
-					self.drawCurveChart();
-				}
-			});
-			holder.appendChild(E('div', { class: 'h5fc-node' }, [
-				tInput, pInput, del
+		}
+
+		this.paintHead();
+		this.paintLiveState();
+		this.paintOverview();
+		this.paintMonitor();
+		this.paintSystem();
+		this.paintDiagnostics();
+		this.syncCurvePreview();
+		this.renderPresets();
+		this.paintError();
+	},
+
+	paintHead: function() {
+		var controller = this.controller(), tone = healthTone(controller.health);
+
+		this.headHealth.textContent = healthName(controller.health);
+		this.headHealth.className = 'h5fan-health%s'.format(tone === 'ok' ? '' : ' is-%s'.format(tone));
+	},
+
+	paintError: function() {
+		if (!this.bannerNode)
+			return;
+
+		clear(this.bannerNode);
+
+		if (!this.fetchError) {
+			this.bannerNode.className = 'h5fan-banner';
+			return;
+		}
+
+		this.bannerNode.className = 'h5fan-banner is-shown';
+		this.bannerNode.appendChild(E('strong', {}, [ _('Reading the controller failed') + ': ' + this.fetchError ]));
+		this.bannerNode.appendChild(E('div', {}, [ this.status
+			? _('Showing the last successful reading.')
+			: _('No data available yet.') ]));
+	},
+
+	paintLiveState: function() {
+		var fan = this.fanState(), thermal = this.thermal(), controller = this.controller();
+		var rows = [], applied = known(fan.applied_pwm) ? fan.applied_pwm : null;
+		var live = known(fan.pwm_value) ? fan.pwm_value : applied;
+
+		rows.push([ _('Control reason'), textValue(reasonName(fan.reason)) ]);
+		rows.push([ _('Mode'), textValue(this.modeName(controller.settings ? controller.settings.mode : this.settings().mode)) ]);
+		rows.push([ _('Requested output'), textValue(known(fan.requested_pwm) ? '%d/255 · %d%%'.format(fan.requested_pwm, percentOfPwm(fan.requested_pwm)) : '\u2014') ]);
+		rows.push([ _('Target output'), textValue(known(fan.target_pwm) ? '%d/255 · %d%%'.format(fan.target_pwm, percentOfPwm(fan.target_pwm)) : '\u2014') ]);
+		rows.push([ _('Applied by controller'), textValue(known(applied) ? '%d/255 · %d%%'.format(applied, percentOfPwm(applied)) : '\u2014') ]);
+		rows.push([ _('Register readback'), textValue(known(live) ? '%d/255 · %d%%'.format(live, percentOfPwm(live)) : '\u2014') ]);
+		rows.push([ _('Kernel safety floor'), textValue(known(thermal.floor_pwm) ? '%d/255'.format(thermal.floor_pwm) : '\u2014',
+			thermal.floor_pwm > 0 ? 'warn' : null) ]);
+		rows.push([ _('Fan ownership'), textValue(thermal.owner || 'unknown') ]);
+		rows.push([ _('Spin-down hold'), textValue(known(fan.down_delay_remaining_s) && fan.down_delay_remaining_s > 0
+			? _('%s s remaining').format(fan.down_delay_remaining_s) : _('not holding')) ]);
+		rows.push([ _('Startup boost'), textValue(fan.boost_applied ? _('used in the last cycle') : _('not used')) ]);
+
+		if (this.controlRows)
+			this.fillRows(this.controlRows, rows);
+
+		if (this.charts) {
+			this.charts.fan.h5update(this.status);
+			this.charts.output.h5update(known(live) ? percentOfPwm(live) : null,
+				fan.kernel_floor_applied ? 'warn' : (known(live) ? 'ok' : 'idle'));
+			this.charts.target.h5update(known(fan.target_percent) ? fan.target_percent : null,
+				fan.kernel_floor_applied ? 'warn' : (known(fan.target_percent) ? 'ok' : 'idle'));
+		}
+
+		if (this.stats) {
+			this.stats.requested.set(known(fan.requested_pwm) ? '%d%%'.format(percentOfPwm(fan.requested_pwm)) : '\u2014',
+				known(fan.requested_pwm) ? '%d/255'.format(fan.requested_pwm) : _('Unavailable'));
+			this.stats.actual.set(known(live) ? '%d%%'.format(percentOfPwm(live)) : '\u2014',
+				known(live) ? _('read back from %s').format(fan.pwm_path || 'pwm1') : _('Unavailable'));
+			this.stats.floor.set(known(thermal.floor_pwm) ? '%d%%'.format(percentOfPwm(thermal.floor_pwm)) : '\u2014',
+				thermal.basis || '', thermal.floor_pwm > 0 ? 'warn' : null);
+			this.stats.rpm.set(
+				fan.rpm_available && known(fan.rpm) ? '%d RPM'.format(fan.rpm) : _('No feedback'),
+				fan.rpm_available ? _('Reported by the tachometer') : _('This board exposes no tachometer reading'),
+				fan.rpm_available ? null : 'warn');
+			this.stats.reason.set(reasonName(fan.reason), controller.result ? _('result: %s').format(controller.result) : '');
+			this.stats.control.set(known(this.status.control.temp_c) ? formatTemp(this.status.control.temp_c) : '\u2014',
+				this.status.control.sensor_label || _('No valid sensor'),
+				known(this.status.control.temp_c) ? null : 'warn');
+		}
+	},
+
+	paintOverview: function() {
+		var settings = this.settings(), controller = this.controller(), rows = [], badges = [];
+
+		if (!this.overviewBadges)
+			return;
+
+		badges.push({ text: _('Mode: %s').format(this.modeName(settings.mode)) });
+
+		if (settings.mode === 'auto')
+			badges.push({ text: _('Curve: %s').format(this.profileName(settings.curve)) });
+
+		if (settings.kernel_only)
+			badges.push({ text: _('Kernel drives the fan'), tone: 'warn' });
+
+		if (settings.curve_valid === false)
+			badges.push({ text: _('Curve invalid'), tone: 'fail' });
+
+		if (controller.sensor_failure)
+			badges.push({ text: _('No valid sensor'), tone: 'fail' });
+
+		if (this.status.sample_mode === 'cached')
+			badges.push({ text: _('cached snapshot') });
+
+		clear(this.overviewBadges);
+
+		badges.forEach(function(badge) {
+			this.overviewBadges.appendChild(E('span', {
+				'class': 'h5fan-badge%s'.format(badge.tone ? ' is-%s'.format(badge.tone) : '')
+			}, [ badge.text ]));
+		}, this);
+
+		rows.push([ _('Snapshot age'), textValue(known(controller.state_age_s) ? formatAge(controller.state_age_s) : _('Never'),
+			controller.stale ? 'warn' : 'ok') ]);
+		rows.push([ _('Running'), textValue(controller.running ? _('yes (PID %s)').format(controller.pid) : _('no'),
+			controller.running ? 'ok' : 'warn') ]);
+		rows.push([ _('Consecutive failures'), textValue(String(controller.consecutive_failures || 0),
+			controller.consecutive_failures ? 'fail' : null) ]);
+		rows.push([ _('Last error'), textValue(dash(controller.last_error), controller.last_error ? 'fail' : null) ]);
+
+		this.fillRows(this.overviewRows, rows);
+	},
+
+	paintMonitor: function() {
+		var sensors = (this.status && this.status.sensors) || [];
+
+		(this.allBars || []).forEach(L.bind(function(bar) {
+			var reading = null, i;
+
+			for (i = 0; i < sensors.length; i++) {
+				if (sensors[i].id === bar.id)
+					reading = sensors[i];
+			}
+
+			bar.chart.h5update(reading);
+		}, this));
+
+		if (!this.monitorTable)
+			return;
+
+		while (this.monitorTable.children.length > 1)
+			this.monitorTable.removeChild(this.monitorTable.lastChild);
+
+		sensors.forEach(function(reading) {
+			var tone = reading.valid ? 'ok' : (reading.status === 'missing' ? null : 'warn');
+
+			this.monitorTable.appendChild(E('tr', {}, [
+				E('td', {}, [ _(reading.title || reading.id) ]),
+				E('td', {}, [ reading.valid ? formatTemp(reading.value_c) : _('Unknown') ]),
+				E('td', {}, [ tag(_(stateName(reading.status)), tone) ]),
+				E('td', {}, [ dash(reading.source) ]),
+				E('td', {}, [ formatAge(reading.age_s) ]),
+				E('td', {}, [ reading.error || dash(reading.label) ])
 			]));
-		});
+		}, this);
 	},
 
-	addCurveNode: function() {
-		var pts = this.customPoints();
-		if (pts.length >= 16) {
-			ui.addNotification(null, E('p', _('At most 16 nodes are supported.')), 'warning');
-			return;
-		}
-		var last = pts[pts.length - 1], temp = Math.min(150, (last ? last.temp : 30) + 5), percent = last ? last.percent : 50;
-		pts.push({ temp: temp, percent: percent });
-		pts.sort(function(a, b) { return a.temp - b.temp; });
-		this.syncCurveValue(pts);
-		this.rebuildCurveEditor();
-		this.drawCurveChart();
-	},
+	paintSystem: function() {
+		var settings = this.settings(), rows = [], fan = this.fanState();
 
-	/* Curve chart ------------------------------------------------- */
-
-	chartGeom: function(points) {
-		var minT = 20, maxT = 100, i;
-		for (i = 0; i < points.length; i++) {
-			minT = Math.min(minT, points[i].temp);
-			maxT = Math.max(maxT, points[i].temp);
-		}
-		maxT = Math.max(maxT + 4, minT + 20);
-		return {
-			l: 46, r: 14, t: 16, b: 34, w: 680, h: 340,
-			minT: minT, maxT: maxT
-		};
-	},
-
-	drawCurveChart: function() {
-		/* Cheap guard: the chart only matters on the curve tab, and a
-		 * redraw during a node drag would break pointer capture. */
-		if (this.draggingNode)
-			return;
-		if (this.activeTab && this.activeTab !== 'curve' && this.curveDrawn)
+		if (!this.systemRows)
 			return;
 
-		var svg = document.getElementById('h5fc-curve-svg');
-		if (!svg)
-			return;
-		var self = this;
-		var profile = this.values.curve || 'balanced';
-		var dataStr = (profile === 'custom') ? this.values.curve_custom : this.values['curve_' + profile];
-		var points = parseCurve(dataStr) || [];
-		var g = this.chartGeom(points);
-		this.lastChartGeom = g;
-		var plotW = g.w - g.l - g.r, plotH = g.h - g.t - g.b;
-		var x = function(t) { return g.l + clamp((t - g.minT) / (g.maxT - g.minT), 0, 1) * plotW; };
-		var y = function(p) { return g.t + (100 - clamp(p, 0, 100)) * plotH / 100; };
-
-		while (svg.firstChild)
-			svg.removeChild(svg.firstChild);
-		this.curveDrawn = true;
-
-		if (points.length < 2) {
-			svg.setAttribute('aria-label', _('Invalid fan curve'));
-			svg.appendChild(svgEl('text', { x: g.w / 2, y: g.h / 2, 'text-anchor': 'middle', 'font-size': 14, fill: 'var(--h5fc-red,#ef6262)' }, _('Invalid curve - check the node table')));
-			return;
-		}
-
-		/* grid */
-		var grid = svgEl('g', { fill: 'none' }), i, tick, step = g.maxT - g.minT > 70 ? 20 : 10;
-		for (tick = Math.ceil(g.minT / step) * step; tick <= g.maxT; tick += step)
-			grid.appendChild(svgEl('line', { x1: x(tick), y1: g.t, x2: x(tick), y2: g.t + plotH, stroke: 'currentColor', 'stroke-opacity': '.08' }));
-		for (i = 0; i <= 100; i += 25)
-			grid.appendChild(svgEl('line', { x1: g.l, y1: y(i), x2: g.l + plotW, y2: y(i), stroke: 'currentColor', 'stroke-opacity': '.1' }));
-		svg.appendChild(grid);
-
-		/* axis labels */
-		var labels = svgEl('g', {});
-		for (tick = Math.ceil(g.minT / step) * step; tick <= g.maxT; tick += step)
-			if (tick % (step * 2) === 0 || step >= 20)
-				labels.appendChild(svgEl('text', { x: x(tick), y: g.h - 12, 'text-anchor': 'middle', 'font-size': 11, fill: 'currentColor', opacity: .55 }, tick + '\u00b0'));
-		for (i = 0; i <= 100; i += 25)
-			labels.appendChild(svgEl('text', { x: g.l - 8, y: y(i) + 4, 'text-anchor': 'end', 'font-size': 11, fill: 'currentColor', opacity: .55 }, i + '%'));
-		labels.appendChild(svgEl('text', { x: g.l + plotW / 2, y: g.h - 1, 'text-anchor': 'middle', 'font-size': 10, fill: 'currentColor', opacity: .45 }, _('Temperature')));
-		svg.appendChild(labels);
-
-		/* kernel floor reference */
-		if (this.status && this.status.safety && this.status.safety.thermal_floor > 0) {
-			var floorPct = Math.round(this.status.safety.thermal_floor * 100 / 255);
-			var fg = svgEl('g', {});
-			fg.appendChild(svgEl('line', { x1: g.l, y1: y(floorPct), x2: g.l + plotW, y2: y(floorPct), stroke: 'var(--h5fc-amber,#f0aa46)', 'stroke-dasharray': '6 5', 'stroke-width': 1.5, opacity: .8 }));
-			fg.appendChild(svgEl('text', { x: g.l + plotW - 4, y: y(floorPct) - 5, 'text-anchor': 'end', 'font-size': 10, fill: 'var(--h5fc-amber,#f0aa46)' }, _('kernel floor %d%%').format(floorPct)));
-			svg.appendChild(fg);
-		}
-
-		/* area + line */
-		var d = 'M' + x(points[0].temp) + ' ' + y(points[0].percent);
-		for (i = 1; i < points.length; i++)
-			d += ' L' + x(points[i].temp) + ' ' + y(points[i].percent);
-		var area = d + ' L' + x(points[points.length - 1].temp) + ' ' + (g.t + plotH) + ' L' + x(points[0].temp) + ' ' + (g.t + plotH) + ' Z';
-		svg.appendChild(svgEl('path', { d: area, fill: 'var(--h5fc-ok,#36c98f)', opacity: .12 }));
-		svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: 'var(--h5fc-ok,#36c98f)', 'stroke-width': 3.5, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
-
-		/* nodes */
-		var editable = profile === 'custom';
-		points.forEach(function(point, index) {
-			var c = svgEl('circle', {
-				cx: x(point.temp), cy: y(point.percent),
-				r: editable ? 7 : 5,
-				fill: '#fff', stroke: 'var(--h5fc-ok,#36c98f)', 'stroke-width': 3,
-				style: editable ? 'cursor:grab' : ''
-			});
-			if (editable) {
-				self.attachNodeDrag(c, index, g);
-				c.addEventListener('dblclick', function(ev) {
-					ev.preventDefault();
-					var pts = self.customPoints();
-					if (pts.length > 2) {
-						pts.splice(index, 1);
-						self.syncCurveValue(pts);
-						self.rebuildCurveEditor();
-						self.drawCurveChart();
-					}
-				});
-			}
-			svg.appendChild(c);
-		});
-
-		/* current operating point marker */
-		var st = this.status;
-		if (st && st.sensors && st.sensors.control && st.sensors.control.temp_c !== null && st.controller && st.controller.mode === 'auto') {
-			var ct = st.sensors.control.temp_c;
-			var pct = Math.round((curvePwm(ct, points) || 0) * 100 / 255);
-			var cx = x(ct);
-			var mg = svgEl('g', {});
-			mg.appendChild(svgEl('line', { x1: cx, y1: g.t, x2: cx, y2: g.t + plotH, stroke: 'var(--h5fc-blue,#55a8ff)', 'stroke-dasharray': '4 4', opacity: .7 }));
-			mg.appendChild(svgEl('circle', { cx: cx, cy: y(pct), r: 6, fill: 'var(--h5fc-blue,#55a8ff)', stroke: '#fff', 'stroke-width': 2 }));
-			mg.appendChild(svgEl('text', { x: clamp(cx + 8, g.l, g.l + plotW - 70), y: y(pct) - 9, 'font-size': 11, 'font-weight': 600, fill: 'var(--h5fc-blue,#55a8ff)' }, ct + '\u00b0C \u00b7 ' + pct + '%'));
-			svg.appendChild(mg);
-		}
-
-		var aria = _('Fan curve: %d points from %d degrees at %d%% to %d degrees at %d%%')
-			.format(points.length, points[0].temp, points[0].percent, points[points.length - 1].temp, points[points.length - 1].percent);
-		svg.setAttribute('aria-label', aria);
-	},
-
-	wireChartClick: function() {
-		/* Wired once; editability is checked at event time so profile
-		 * switches do not pile up listeners. */
-		var self = this;
-		var svg = document.getElementById('h5fc-curve-svg');
-		if (!svg || svg.dataset.h5fcClickWired)
-			return;
-		svg.dataset.h5fcClickWired = '1';
-		svg.addEventListener('pointerdown', function(ev) {
-			if (self.values.curve !== 'custom')
-				return;
-			if (ev.target.tagName === 'circle' || ev.target.tagName === 'text')
-				return;
-			var g = self.lastChartGeom;
-			if (!g)
-				return;
-			var rect = svg.getBoundingClientRect();
-			var plotW = g.w - g.l - g.r, plotH = g.h - g.t - g.b;
-			var sx = (ev.clientX - rect.left) * g.w / rect.width;
-			var sy = (ev.clientY - rect.top) * g.h / rect.height;
-			if (sx < g.l || sx > g.l + plotW || sy < g.t || sy > g.t + plotH)
-				return;
-			var temp = clamp(Math.round(g.minT + (sx - g.l) / plotW * (g.maxT - g.minT)), 0, 150);
-			var percent = clamp(Math.round(100 - (sy - g.t) * 100 / plotH), 0, 100);
-			var pts = self.customPoints();
-			if (pts.length >= 16)
-				return;
-			pts.push({ temp: temp, percent: percent });
-			pts.sort(function(a, b) { return a.temp - b.temp; });
-			if (parseCurve(pts.map(function(p) { return p.temp + ':' + p.percent; }).join(','))) {
-				self.syncCurveValue(pts);
-				self.rebuildCurveEditor();
-				self.drawCurveChart();
-			}
-		});
-	},
-
-	attachNodeDrag: function(circle, index, g) {
-		var self = this;
-		circle.addEventListener('pointerdown', function(ev) {
-			ev.preventDefault();
-			var svg = document.getElementById('h5fc-curve-svg');
-			var rect = svg.getBoundingClientRect();
-			var plotW = g.w - g.l - g.r, plotH = g.h - g.t - g.b;
-			var x = function(t) { return g.l + clamp((t - g.minT) / (g.maxT - g.minT), 0, 1) * plotW; };
-			var y = function(p) { return g.t + (100 - clamp(p, 0, 100)) * plotH / 100; };
-			circle.setPointerCapture(ev.pointerId);
-			circle.style.cursor = 'grabbing';
-			self.draggingNode = true;
-
-			var move = function(e) {
-				var pts = self.customPoints();
-				if (!pts[index])
-					return;
-				var sx = (e.clientX - rect.left) * g.w / rect.width;
-				var sy = (e.clientY - rect.top) * g.h / rect.height;
-				/* keep at least 1 degree distance to the neighbours */
-				var lo = index ? pts[index - 1].temp + 1 : 0;
-				var hi = (index < pts.length - 1) ? pts[index + 1].temp - 1 : 150;
-				var temp = clamp(Math.round(g.minT + (sx - g.l) / plotW * (g.maxT - g.minT)), lo, hi);
-				var percent = clamp(Math.round(100 - (sy - g.t) * 100 / plotH), 0, 100);
-				pts[index] = { temp: temp, percent: percent };
-				circle.setAttribute('cx', x(temp));
-				circle.setAttribute('cy', y(percent));
-				self.pendingPoints = pts;
-			};
-
-			var up = function(e) {
-				try { circle.releasePointerCapture(e.pointerId); } catch (err) { }
-				circle.style.cursor = 'grab';
-				window.removeEventListener('pointermove', move);
-				window.removeEventListener('pointerup', up);
-				self.draggingNode = false;
-				if (self.pendingPoints) {
-					var sorted = self.pendingPoints.slice().sort(function(a, b) { return a.temp - b.temp; });
-					self.pendingPoints = null;
-					self.syncCurveValue(sorted);
-					self.rebuildCurveEditor();
-					self.drawCurveChart();
-				}
-			};
-			window.addEventListener('pointermove', move);
-			window.addEventListener('pointerup', up);
-		});
-	},
-
-	/* ---- monitor tab ---- */
-
-	renderMonitor: function() {
-		var self = this;
-		var sensors = [
-			{ id: 'cpu', name: _('CPU'), bands: BANDS_CPU, kernelAligned: true },
-			{ id: 'phy', name: _('Ethernet PHY'), bands: BANDS_GENERIC },
-			{ id: 'wifi1', name: _('Wi-Fi radio 1'), bands: BANDS_GENERIC },
-			{ id: 'wifi2', name: _('Wi-Fi radio 2'), bands: BANDS_GENERIC },
-			{ id: 'module', name: _('5G modem'), bands: BANDS_GENERIC }
-		];
-		return E('div', { class: 'h5fc-panel' }, [
-			E('div', { class: 'h5fc-panel-head' }, [
-				E('h3', _('Temperature monitoring')),
-				E('span', { class: 'h5fc-badge', id: 'h5fc-mon-control' }, '\u2014')
-			]),
-			E('div', { class: 'h5fc-gauges' }, sensors.map(function(s) {
-				return E('div', { class: 'h5fc-card h5fc-gauge', id: 'h5fc-gauge-' + s.id }, [
-					E('div', { class: 'h5fc-gauge-name' }, [ s.name, E('span', { class: 'h5fc-badge mute', id: 'h5fc-gauge-' + s.id + '-band', style: 'font-size:10px;padding:2px 6px' }, '\u2014') ]),
-					self.gaugeSvg('h5fc-gauge-' + s.id + '-svg'),
-					E('div', { class: 'h5fc-gauge-src', id: 'h5fc-gauge-' + s.id + '-src' }, '\u2014')
-				]);
-			})),
-			E('div', { class: 'h5fc-note' },
-				_('Colour bands are plugin reference values. The CPU bands mirror the controller\u2019s kernel cooling-map floors (83/113\u00b0C); other sensors use conservative engineering estimates, not official vendor limits. A missing reading is shown as unknown, never as 0\u00b0C.'))
-		]);
-	},
-
-	gaugeSvg: function(id) {
-		/* 180 degree arc gauge, r=78, centre (100,96) */
-		var a = function(pct) {
-			var angle = Math.PI * (1 - clamp(pct, 0, 100) / 100);
-			return [100 + 78 * Math.cos(angle), 96 - 78 * Math.sin(angle)];
-		};
-		var end = a(100);
-		var svg = svgEl('svg', { viewBox: '0 0 200 112', width: '190', height: '106', id: id, role: 'img' });
-		svg.appendChild(svgEl('path', { d: 'M22 96 A78 78 0 0 1 178 96', fill: 'none', stroke: 'currentColor', 'stroke-opacity': '.12', 'stroke-width': 13, 'stroke-linecap': 'round' }));
-		svg.appendChild(svgEl('path', { d: 'M22 96 A78 78 0 0 1 ' + end[0].toFixed(1) + ' ' + end[1].toFixed(1), fill: 'none', stroke: 'var(--h5fc-ok,#36c98f)', 'stroke-width': 13, 'stroke-linecap': 'round', id: id + '-arc', opacity: .9 }));
-		svg.appendChild(svgEl('text', { x: 100, y: 92, 'text-anchor': 'middle', 'font-size': 24, 'font-weight': 700, fill: 'currentColor', id: id + '-val' }, '\u2014'));
-		svg.appendChild(svgEl('text', { x: 100, y: 107, 'text-anchor': 'middle', 'font-size': 10, fill: 'currentColor', opacity: .55 }, '\u00b0C'));
-		return svg;
-	},
-
-	/* ---- settings tab ---- */
-
-	renderSettings: function() {
-		var self = this;
-		var num = function(key, label, desc) {
+		[ 'interval', 'hysteresis', 'down_delay', 'start_pwm', 'start_boost_ms', 'fail_pwm' ].forEach(L.bind(function(key) {
 			var spec = OPTIONS[key];
-			var input = E('input', {
-				type: 'number', min: spec.min, max: spec.max, step: 1,
-				class: 'h5fc-input', id: 'h5fc-set-' + key, value: this.values[key]
-			});
-			var errEl = E('div', { class: 'h5fc-err' });
-			input.addEventListener('input', function() {
-				var res = validateOption(key, input.value);
-				var ok = res === true;
-				input.classList.toggle('err', !ok);
-				errEl.textContent = ok ? '' : String(res);
-				var fieldEl = input.closest('.h5fc-field');
-				if (fieldEl)
-					fieldEl.classList.toggle('invalid', !ok);
-				if (ok)
-					self.setValue(key, input.value);
-			});
-			var unit = spec.unit ? (' [' + spec.unit + ']') : '';
-			return this.field(label + unit, desc + ' ' + _('Default: %s \u00b7 range %d\u2013%d.').format(spec.def, spec.min, spec.max), E('div', {}, [ input, errEl ]));
-		};
+			this.validateOption(key, false);
+			rows.push([ _('Saved %s').format(_(spec.label)), textValue('%s %s'.format(dash(settings[key]), spec.unit || '')) ]);
+		}, this));
 
-		return E('div', { class: 'h5fc-panel' }, [
-			E('div', { class: 'h5fc-panel-head' }, [
-				E('h3', _('Response and safety parameters')),
-				E('span', { class: 'h5fc-badge', id: 'h5fc-set-note' }, _('Changes apply after Save'))
-			]),
-			E('div', { class: 'h5fc-grid c3' }, [
-				num.call(this, 'interval', _('Control interval'), _('Seconds between control decisions. The dashboard refreshes independently.')),
-				num.call(this, 'hysteresis', _('Temperature hysteresis'), _('Prevents repeated speed changes around a curve point.')),
-				num.call(this, 'down_delay', _('Speed-down delay'), _('Wait this many seconds before lowering fan output; increases apply immediately.')),
-				num.call(this, 'start_pwm', _('Startup boost PWM'), _('Kick-off pulse used when the fan restarts from standstill.')),
-				num.call(this, 'start_boost_ms', _('Startup boost duration'), _('A short boost helps a stopped fan start reliably. Set 0 to disable.')),
-				num.call(this, 'fail_pwm', _('Sensor-failure PWM'), _('Output used when no valid sensor reading or an invalid curve is detected.'))
-			]),
-			E('div', { class: 'h5fc-note' },
-				_('These parameters never bypass kernel protection: CPU throttling, hot and critical trips stay under kernel control in every mode.'))
-		]);
+		rows.push([ _('Control temperature source'), textValue(settings.temp_source === 'cpu' ? _('CPU only') : _('Hottest valid sensor')) ]);
+		rows.push([ _('Effective curve'), textValue('%s · %s'.format(this.profileName(settings.curve), dash(settings.curve_data))) ]);
+		rows.push([ _('Schema version'), textValue(dash(settings.schema_version)) ]);
+		rows.push([ _('Controller version'), textValue(dash(this.controller().version)) ]);
+
+		this.fillRows(this.systemRows, rows);
 	},
 
-	/* ---- diagnostics tab ---- */
+	paintDiagnostics: function() {
+		var controller = this.controller(), thermal = this.thermal(), protections = this.protections();
+		var paths = this.status.paths || {}, rows = [];
 
-	renderDiagnostics: function() {
-		var self = this;
-		return E('div', { class: 'h5fc-panel' }, [
-			E('div', { class: 'h5fc-panel-head' }, [
-				E('h3', _('Diagnostics')),
-				E('span', { class: 'h5fc-badge', id: 'h5fc-diag-health' }, '\u2014')
-			]),
-			E('div', { class: 'h5fc-grid c2' }, [
-				E('div', { class: 'h5fc-card' }, [
-					E('div', { class: 'h5fc-card-title' }, _('Controller')),
-					E('dl', { class: 'h5fc-kv', id: 'h5fc-diag-ctl' })
-				]),
-				E('div', { class: 'h5fc-card' }, [
-					E('div', { class: 'h5fc-card-title' }, _('Kernel thermal protection')),
-					E('dl', { class: 'h5fc-kv', id: 'h5fc-diag-safety' })
-				])
-			]),
-			E('div', { class: 'h5fc-card', style: 'margin-top:12px' }, [
-				E('div', { class: 'h5fc-card-title' }, _('Configuration check')),
-				E('div', { id: 'h5fc-diag-cfg', class: 'h5fc-hint', style: 'white-space:normal' } , '\u2014')
-			]),
-			E('details', { style: 'margin-top:12px' }, [
-				E('summary', { style: 'cursor:pointer;font-size:13px;font-weight:600' }, _('Raw controller status (JSON)')),
-				E('pre', { class: 'h5fc-pre', id: 'h5fc-diag-raw' }, '\u2014')
-			])
+		if (!this.diagRows)
+			return;
+
+		rows.push([ _('Health'), textValue(healthName(controller.health), healthTone(controller.health)) ]);
+		rows.push([ _('Result'), textValue(controller.result || 'none') ]);
+		rows.push([ _('Cycles'), textValue(String(controller.cycle_count || 0)) ]);
+		rows.push([ _('Last good cycle'), textValue(controller.last_good_cycle ? formatClock(controller.last_good_cycle) : _('Never')) ]);
+		rows.push([ _('Sampling interval'), textValue('%s s'.format(dash(controller.interval_s))) ]);
+		rows.push([ _('Status source'), textValue(this.status.sample_mode === 'live' ? _('live sample') : _('published snapshot')) ]);
+		rows.push([ _('Legacy policy record'), textValue(thermal.legacy_policy_pending
+			? _('waiting to be restored') : _('none'), thermal.legacy_policy_pending ? 'warn' : null) ]);
+
+		this.fillRows(this.diagRows, rows);
+
+		this.fillRows(this.protectRows, [
+			[ _('Kernel protections'), textValue(protections.intact ? _('intact') : _('incomplete'),
+				protections.intact ? 'ok' : 'fail') ],
+			[ _('Thermal governor'), textValue(dash(protections.policy)) ],
+			[ _('Governor hijacked'), textValue(protections.governor_hijacked ? _('user_space in use') : _('no'),
+				protections.governor_hijacked ? 'fail' : 'ok') ],
+			[ _('CPU throttling device'), textValue(protections.cpufreq_cooling ? _('registered') : _('missing'),
+				protections.cpufreq_cooling ? 'ok' : 'warn') ],
+			[ _('Fan cooling device'), textValue(dash(protections.fan_cooling_device)) ],
+			[ _('Critical trip'), textValue(this.criticalTripText(protections)) ],
+			[ _('Cooling levels'), textValue((thermal.cooling_levels || []).join(' / ') || '\u2014') ],
+			[ _('Floor basis'), textValue(dash(thermal.basis)) ]
 		]);
+
+		if (protections.warnings && protections.warnings.length) {
+			protections.warnings.forEach(L.bind(function(warning) {
+				this.diagRows.appendChild(E('p', { 'class': 'h5fan-note is-warn' }, [ warning ]));
+			}, this));
+		}
+
+		clear(this.issueBox);
+
+		if (!(this.settings().issues || []).length)
+			this.issueBox.appendChild(E('p', { 'class': 'h5fan-empty' }, [ _('The configuration was accepted as-is.') ]));
+		else
+			(this.settings().issues || []).forEach(function(issue) {
+				this.issueBox.appendChild(E('p', { 'class': 'h5fan-note is-warn' }, [
+					_('%1$s = %2$s: %3$s (using %4$s)').format(issue.option, dash(issue.value), issue.problem, issue.applied)
+				]));
+			}, this);
+
+		while (this.eventTable.children.length > 1)
+			this.eventTable.removeChild(this.eventTable.lastChild);
+
+		if (!(this.status.events || []).length) {
+			this.eventTable.appendChild(E('tr', {}, [
+				E('td', { colspan: '4', 'class': 'h5fan-empty' }, [ _('No events recorded yet') ])
+			]));
+		}
+
+		(this.status.events || []).slice(0, 40).forEach(function(event) {
+			this.eventTable.appendChild(E('tr', {}, [
+				E('td', {}, [ formatClock(event.ts) ]),
+				E('td', {}, [ tag(event.level, event.level === 'error' ? 'fail' : (event.level === 'warn' ? 'warn' : 'ok')) ]),
+				E('td', {}, [ dash(event.code) ]),
+				E('td', {}, [ dash(event.message) ])
+			]));
+		}, this);
+
+		[
+			[ _('Configuration file'), paths.uci_config ],
+			[ _('State file'), paths.state ],
+			[ _('Event journal'), paths.event_log ],
+			[ _('Lock directory'), paths.lock_dir ]
+		].forEach(L.bind(function(pair) {
+			this.diagRows.appendChild(row(pair[0], textValue(dash(pair[1]))));
+		}, this));
 	},
 
-	/* ----------------------------------------------------------- *
-	 * live status updates                                         *
-	 * ----------------------------------------------------------- */
+	criticalTripText: function(protections) {
+		var trips = protections.trips || [], i;
 
-	reasonName: function(reason) {
-		var kernelFloor = (reason || '').indexOf('+kernel-floor') > -1;
-		var base = (reason || '').replace('+kernel-floor', '');
-		var text;
-		if (base === 'auto-down-delay') text = _('Waiting before speed down');
-		else if (base === 'auto') text = _('Automatic curve');
-		else if (base === 'manual') text = _('Manual request');
-		else if (base === 'kernel') text = _('Kernel protection');
-		else if (base === 'sensor-failsafe') text = _('Sensor failsafe');
-		else if (base === 'curve-failsafe') text = _('Curve failsafe');
-		else text = base || '\u2014';
-		return kernelFloor ? _('%s \u00b7 kernel safety floor').format(text) : text;
+		for (i = 0; i < trips.length; i++) {
+			if (trips[i].type === 'critical' && known(trips[i].temp_c))
+				return formatTemp(trips[i].temp_c);
+		}
+
+		return _('not declared');
+	},
+
+	fillRows: function(node, entries) {
+		clear(node);
+
+		entries.forEach(function(entry) {
+			node.appendChild(row(entry[0], entry[1]));
+		});
 	},
 
 	modeName: function(mode) {
-		if (mode === 'manual') return _('Manual');
-		if (mode === 'kernel') return _('Kernel protection only');
+		if (mode === 'manual')
+			return _('Manual');
+
+		if (mode === 'kernel')
+			return _('Kernel protection only');
+
 		return _('Automatic');
 	},
 
-	profileName: function(p) {
-		if (p === 'silent') return _('Quiet');
-		if (p === 'performance') return _('Performance');
-		if (p === 'custom') return _('Custom');
+	profileName: function(profile) {
+		if (profile === 'silent')
+			return _('Quiet');
+
+		if (profile === 'performance')
+			return _('Performance');
+
+		if (profile === 'custom')
+			return _('Custom');
+
 		return _('Balanced');
 	},
 
-	ownerName: function(owner) {
-		if (owner === 'shared') return _('Shared with kernel');
-		if (owner === 'userspace' || owner === 'userspace-pwm') return _('Userspace (kernel CPU throttling intact)');
-		if (owner === 'kernel') return _('Kernel only');
-		return _('Unknown');
-	},
+	/* ------------------------------------------------------- curve editor */
 
-	sourceName: function(src) {
-		if (src === 'thermal-zone') return _('Native thermal zone');
-		if (src === 'hwmon') return _('Native hwmon');
-		if (src === 'vendor-iwpriv') return _('Vendor driver (iwpriv)');
-		if (src === 'modem-cache') return _('Modem manager cache');
-		if (src === 'legacy-cache') return _('Legacy modem cache');
-		return _('Not available');
-	},
+	renderPresets: function() {
+		var seg = document.getElementById('h5fan-preset-seg');
 
-	setText: function(id, text) {
-		var node = document.getElementById(id);
-		if (node)
-			node.textContent = text;
-	},
-
-	setHtml: function(id, html) {
-		var node = document.getElementById(id);
-		if (node)
-			node.innerHTML = html;
-	},
-
-	fillKv: function(id, pairs) {
-		var node = document.getElementById(id);
-		if (!node)
+		if (!seg)
 			return;
-		while (node.firstChild)
-			node.removeChild(node.firstChild);
-		pairs.forEach(function(pair) {
-			node.appendChild(E('dt', {}, pair[0]));
-			node.appendChild(E('dd', {}, pair[1] === undefined || pair[1] === null || pair[1] === '' ? '\u2014' : String(pair[1])));
+
+		clear(seg);
+
+		(OPTIONS.curve.choices || []).forEach(L.bind(function(choice) {
+			var input = E('input', {
+				type: 'radio', name: 'h5fan-preset', value: choice[0]
+			});
+
+			input.checked = this.values.curve === choice[0];
+			input.addEventListener('change', L.bind(function() {
+				this.values.curve = choice[0];
+				this.syncWidget('curve');
+				this.afterChange('curve');
+			}, this));
+
+			seg.appendChild(E('label', { 'class': this.values.curve === choice[0] ? 'is-on' : null }, [
+				input, _(choice[1])
+			]));
+		}, this));
+	},
+
+	syncWidget: function(key) {
+		var input = this.widgetInput[key];
+
+		if (!input)
+			return;
+
+		if (OPTIONS[key].kind === 'switch')
+			input.checked = this.values[key] === '1';
+		else
+			input.value = this.values[key];
+
+		if (this.widgetRange && this.widgetRange[key])
+			this.widgetRange[key].value = this.values[key];
+	},
+
+	editorFromSpec: function(spec) {
+		this.editorPoints = parseCurve(spec).points.map(function(point) {
+			return { temp: point.temp, percent: point.percent };
+		});
+
+		if (!this.editorPoints.length) {
+			this.editorPoints = OPTIONS.curve_custom.def.split(',').map(function(pair) {
+				var parts = pair.split(':');
+				return { temp: parseInt(parts[0], 10), percent: parseInt(parts[1], 10) };
+			});
+		}
+
+		this.renderNodes();
+	},
+
+	renderNodes: function() {
+		if (!this.nodeList)
+			return;
+
+		clear(this.nodeList);
+
+		this.editorPoints.forEach(L.bind(function(point, index) {
+			var temp = E('input', {
+				type: 'number', 'class': 'cbi-input-text', min: '0', max: '150', step: '1', value: String(point.temp)
+			});
+			var percent = E('input', {
+				type: 'number', 'class': 'cbi-input-text', min: '0', max: '100', step: '1', value: String(point.percent)
+			});
+
+			temp.addEventListener('input', L.bind(function(ev) {
+				this.editorPoints[index].temp = num(ev.target.value);
+				this.commitNodes();
+			}, this));
+			percent.addEventListener('input', L.bind(function(ev) {
+				this.editorPoints[index].percent = num(ev.target.value);
+				this.commitNodes();
+			}, this));
+
+			this.nodeList.appendChild(E('div', { 'class': 'h5fan-noderow' }, [
+				E('label', {}, [ _('Temperature °C'), temp ]),
+				E('label', {}, [ _('Output %'), percent ]),
+				E('button', {
+					'class': 'btn cbi-button-negative', type: 'button',
+					'aria-label': _('Delete point'),
+					click: L.bind(function() {
+						this.editorPoints.splice(index, 1);
+						this.commitNodes();
+						this.renderNodes();
+					}, this)
+				}, [ '\u00d7' ])
+			]));
+		}, this));
+
+		this.commitNodes();
+	},
+
+	commitNodes: function() {
+		var sorted = this.editorPoints.filter(function(point) {
+			return known(point.temp) && known(point.percent);
+		}).sort(function(a, b) {
+			return a.temp - b.temp;
+		});
+		var spec = sorted.map(function(point) {
+			return '%d:%d'.format(point.temp, point.percent);
+		}).join(',');
+		var parsed = parseCurve(spec);
+
+		this.nodeError.textContent = parsed.error || '';
+
+		if (!parsed.error || spec === '') {
+			this.values.curve_custom = spec;
+			this.syncWidget('curve_custom');
+			this.validateOption('curve_custom', true);
+			this.markDirty();
+		}
+
+		this.syncCurvePreview();
+	},
+
+	syncCurvePreview: function() {
+		var settings = this.settings(), fan = this.fanState(), key, spec;
+
+		if (!this.charts)
+			return;
+
+		/* Draw the curve that would be effective with the draft values, using
+		 * the same profile-to-option mapping the controller applies. */
+		key = CURVE_OPTION[this.values.curve] || CURVE_OPTION.balanced;
+		spec = known(this.values[key]) && this.values[key] !== ''
+			? this.values[key]
+			: (settings[key] || settings.curve_data || OPTIONS[key].def);
+
+		this.drawCurve(spec);
+	},
+
+	drawCurve: function(spec) {
+		var points = parseCurve(spec), fan = this.fanState();
+
+		this.charts.curve.h5update({
+			points: points.points,
+			error: points.error,
+			control: this.status ? this.status.control : null,
+			targetPercent: known(fan.target_percent) ? fan.target_percent : null,
+			floorPercent: known(this.thermal().floor_percent) ? this.thermal().floor_percent : null
 		});
 	},
 
-	updateStatus: function(st) {
-		var connLost = document.getElementById('h5fc-conn-lost');
-		if (connLost)
-			connLost.classList.toggle('show', !st);
-		if (!st)
-			return;
+	/* ---------------------------------------------------------- save paths */
 
-		var ctl = st.controller || {};
-		var sensors = st.sensors || {};
-		var fan = st.fan || {};
-		var safety = st.safety || {};
-		var effectiveMode = this.values.mode || ctl.mode;
-		var effectiveEnabled = this.values.enabled !== '0';
-		var effectiveCurve = this.values.curve || ctl.curve;
+	confirmRestart: function() {
+		return this.confirm(_('Restart the fan control service? The fan keeps its current output while the service restarts.'))
+			.then(L.bind(function(ok) {
+				if (!ok)
+					return null;
 
-		/* health chip */
-		var health = document.getElementById('h5fc-health');
-		if (health) {
-			var h = ctl.health || 'unknown';
-			health.className = 'h5fc-health' + (h === 'ok' ? '' : ' ' + h);
-			health.textContent = h === 'ok' ? _('Running normally')
-				: h === 'warn' ? _('Status delayed')
-				: h === 'fail' ? (ctl.result === 'failsafe' ? _('Failsafe cooling active') : _('Controller error'))
-				: _('No data yet');
-		}
+				return fs.exec(INITD_CMD, [ 'restart' ]).then(L.bind(function(result) {
+					if (result && result.code !== 0)
+						this.notify(_('The service could not be restarted: %s').format(result.stderr || ''), 'danger');
+					else
+						this.notify(_('Service restarted.'), 'info');
 
-		/* fan widget */
-		this.updateFanWidget(fan, ctl, safety);
-
-		/* overview cards */
-		var controlTemp = sensors.control ? sensors.control.temp_c : null;
-		this.setText('h5fc-ov-mode-value', effectiveEnabled ? this.modeName(effectiveMode) : _('Controller disabled'));
-		this.setText('h5fc-ov-mode-hint', effectiveEnabled && effectiveMode === 'auto' ? this.profileName(effectiveCurve) : '');
-		this.setText('h5fc-ov-target-value', fan.target_pwm !== null && fan.target_pwm !== undefined ? fmtPwm(fan.target_pwm) : '\u2014');
-		this.setText('h5fc-ov-target-hint', _('requested: %s').format(fan.requested_pwm !== null && fan.requested_pwm !== undefined ? fmtPwm(fan.requested_pwm) : '\u2014'));
-		this.setText('h5fc-ov-applied-value', fan.applied_pwm !== null && fan.applied_pwm !== undefined ? fmtPwm(fan.applied_pwm) : (fan.pwm !== null && fan.pwm !== undefined ? fmtPwm(fan.pwm) : '\u2014'));
-		this.setText('h5fc-ov-applied-hint', fan.pwm_path ? fan.pwm_path : '');
-		this.setText('h5fc-ov-control-value', fmtTemp(controlTemp));
-		this.setText('h5fc-ov-control-hint', sensors.control && sensors.control.label ? sensors.control.label : _('No valid sensor'));
-
-		var self = this;
-		var tempCard = function(id, sensor) {
-			self.setText(id + '-value', sensor && sensor.temp_c !== null && sensor.temp_c !== undefined ? fmtTemp(sensor.temp_c) : '\u2014');
-			self.setText(id + '-hint', sensor && sensor.label ? sensor.label : '');
-		};
-		tempCard('h5fc-ov-cpu', sensors.cpu);
-		tempCard('h5fc-ov-phy', sensors.phy);
-		var wifiTemps = [sensors.wifi1, sensors.wifi2].filter(function(s) { return s && s.temp_c !== null && s.temp_c !== undefined; });
-		this.setText('h5fc-ov-wifi-value', wifiTemps.length ? wifiTemps.map(function(s) { return s.temp_c + '\u00b0C'; }).join(' / ') : '\u2014');
-		this.setText('h5fc-ov-wifi-hint', [sensors.wifi1, sensors.wifi2].filter(Boolean).map(function(s) { return s.label; }).filter(Boolean).join(' \u00b7 '));
-		tempCard('h5fc-ov-modem', sensors.module);
-
-		/* safety chips */
-		this.setText('h5fc-ch-health-v', ctl.health === 'ok' ? _('Normal') : ctl.health === 'warn' ? _('Delayed') : ctl.health === 'fail' ? _('Fault') : _('Unknown'));
-		this.setText('h5fc-ch-floor-v', safety.thermal_floor > 0 ? fmtPwm(safety.thermal_floor) : _('inactive'));
-		this.setText('h5fc-ch-delay-v', safety.down_delay_active ? _('holding') : _('not waiting'));
-		this.setText('h5fc-ch-owner-v', this.ownerName(safety.thermal_owner));
-		this.setText('h5fc-ch-rpm-v', fan.rpm_supported ? (fan.rpm !== null && fan.rpm !== undefined ? fan.rpm + ' RPM' : '\u2014') : _('unsupported'));
-
-		var note = document.getElementById('h5fc-ov-note');
-		if (note) {
-			note.className = 'h5fc-note';
-			if (safety.cpu_throttling_intact === false) {
-				note.className += ' fail';
-				note.textContent = _('Warning: the CPU thermal governor reports user_space. Kernel CPU throttling may be disabled - check your firmware and the controller release notes.');
-			}
-			else if (ctl.result === 'failsafe') {
-				note.className += ' warn';
-				note.textContent = _('Failsafe cooling is active (%s). The controller detected a problem and drives a high output until it recovers.').format(this.reasonName(ctl.reason));
-			}
-			else if (safety.thermal_owner === 'userspace' || safety.thermal_owner === 'userspace-pwm') {
-				note.textContent = _('The fan manager owns the fan policy. Kernel CPU throttling and hot/critical over-temperature protection remain active.');
-			}
-			else {
-				note.textContent = _('Kernel thermal protection is always retained; when the kernel requires more cooling the effective output is raised automatically.');
-			}
-		}
-
-		/* control tab live strip */
-		var liveState = effectiveEnabled ? this.modeName(effectiveMode) : _('disabled');
-		this.setText('h5fc-ctl-live', liveState);
-		this.setText('h5fc-ctl-requested-value', fan.requested_pwm !== null && fan.requested_pwm !== undefined ? fmtPwm(fan.requested_pwm) : '\u2014');
-		this.setText('h5fc-ctl-target-value', fan.target_pwm !== null && fan.target_pwm !== undefined ? fmtPwm(fan.target_pwm) : '\u2014');
-		this.setText('h5fc-ctl-applied-value', fan.applied_pwm !== null && fan.applied_pwm !== undefined ? fmtPwm(fan.applied_pwm) : (fan.pwm !== undefined ? fmtPwm(fan.pwm) : '\u2014'));
-		this.setText('h5fc-ctl-reason-value', this.reasonName(ctl.reason));
-		this.setText('h5fc-ctl-reason-hint', ctl.last_error || '');
-
-		/* curve tab */
-		this.setText('h5fc-curve-now-value', (controlTemp !== null && ctl.mode === 'auto') ? fmtTemp(controlTemp) : '\u2014');
-		this.setText('h5fc-curve-now-hint', (controlTemp !== null && ctl.mode === 'auto') ? _('target %s').format(fan.target_pwm !== undefined ? fmtPwm(fan.target_pwm) : '\u2014') : '');
-		this.setText('h5fc-curve-floor-value', safety.thermal_floor > 0 ? fmtPwm(safety.thermal_floor) : '\u2014');
-		this.setText('h5fc-curve-floor-hint', _('cooling state %s / %s').format(safety.thermal_state, safety.thermal_max_state));
-		var curveNote = document.getElementById('h5fc-curve-note');
-		if (curveNote) {
-			curveNote.className = 'h5fc-note';
-			curveNote.textContent = (effectiveCurve === 'custom')
-				? _('Editing the custom curve. Invalid combinations are rejected before saving; the interpolation matches the controller exactly.')
-				: _('Showing the %s preset from the saved configuration. Switch to Custom to edit your own points.').format(this.profileName(effectiveCurve));
-		}
-		this.drawCurveChart();
-
-		/* monitor gauges */
-		this.updateGauge('cpu', sensors.cpu, BANDS_CPU, sensors.control);
-		this.updateGauge('phy', sensors.phy, BANDS_GENERIC, sensors.control);
-		this.updateGauge('wifi1', sensors.wifi1, BANDS_GENERIC, sensors.control);
-		this.updateGauge('wifi2', sensors.wifi2, BANDS_GENERIC, sensors.control);
-		this.updateGauge('module', sensors.module, BANDS_GENERIC, sensors.control);
-		this.setText('h5fc-mon-control', controlTemp !== null ? _('Control input: %s (%s)').format(fmtTemp(controlTemp), sensors.control.label || '-') : _('No valid control sensor'));
-
-		/* diagnostics */
-		var diagBadge = document.getElementById('h5fc-diag-health');
-		if (diagBadge) {
-			diagBadge.className = 'h5fc-badge ' + (ctl.health === 'ok' ? 'ok' : ctl.health === 'warn' ? 'warn' : 'fail');
-			diagBadge.textContent = ctl.health === 'ok' ? _('Healthy') : ctl.health === 'warn' ? _('Stale status') : ctl.health === 'fail' ? _('Fault') : _('No data');
-		}
-		this.fillKv('h5fc-diag-ctl', [
-			[_('Daemon running'), ctl.running ? _('yes') : _('no')],
-			[_('Result'), ctl.result || '\u2014'],
-			[_('Reason'), ctl.reason || '\u2014'],
-			[_('State age'), ctl.state_age !== null && ctl.state_age !== undefined ? _('%d s').format(ctl.state_age) : '\u2014'],
-			[_('Last success'), ctl.last_success ? new Date(ctl.last_success * 1000).toLocaleString() : '\u2014'],
-			[_('Last error'), ctl.last_error || _('none')],
-			[_('Controller version'), ctl.version || '\u2014'],
-			[_('Status source'), st.source === 'snapshot' ? _('daemon snapshot') : _('live query')]
-		]);
-		this.fillKv('h5fc-diag-safety', [
-			[_('Fan ownership'), this.ownerName(safety.thermal_owner)],
-			[_('Kernel governor'), safety.kernel_policy || '\u2014'],
-			[_('Thermal zone'), safety.kernel_zone || '\u2014'],
-			[_('CPU throttling intact'), safety.cpu_throttling_intact === false ? _('NO - user_space detected!') : _('yes')],
-			[_('Cooling state'), '%s / %s'.format(safety.thermal_state, safety.thermal_max_state)],
-			[_('Kernel safety floor'), safety.thermal_floor > 0 ? fmtPwm(safety.thermal_floor) : _('inactive')],
-			[_('Speed-down delay'), safety.down_delay_active ? _('holding output') : _('inactive')]
-		]);
-		var cfgErrors = this.validateAll();
-		this.setHtml('h5fc-diag-cfg', cfgErrors.length
-			? '<span style="color:var(--h5fc-red,#ef6262)">' + _('Problems found:') + ' ' + cfgErrors.join('; ') + '</span>'
-			: _('All configured values are valid.'));
-		var raw = document.getElementById('h5fc-diag-raw');
-		if (raw) {
-			try {
-				raw.textContent = JSON.stringify(st, null, 2);
-			}
-			catch (e) {
-				raw.textContent = String(st);
-			}
-		}
+					return this.refresh();
+				}, this));
+			}, this)).catch(L.bind(function(err) {
+				this.notify(_('The service could not be restarted: %s').format(err.message || err), 'danger');
+			}, this));
 	},
 
-	updateFanWidget: function(fan, ctl, safety) {
-		var box = document.getElementById('h5fc-fanbox');
-		var svg = document.getElementById('h5fc-fan-svg');
-		if (!box || !svg)
-			return;
-		var pct = null;
-		var applied = (fan.applied_pwm !== null && fan.applied_pwm !== undefined) ? fan.applied_pwm : fan.pwm;
-		if (applied !== null && applied !== undefined)
-			pct = Math.round(applied * 100 / 255);
+	confirmFactoryDefaults: function() {
+		return this.confirm(_('Restore every option to the values shipped with the package? Nothing is written until you save.'))
+			.then(L.bind(function(ok) {
+				if (!ok)
+					return null;
 
-		var running, color, label;
-		if (ctl.health === 'fail') {
-			running = true; /* keep spinning - fail-safe drives high output */
-			color = 'var(--h5fc-amber,#f0aa46)';
-			label = _('FAILSAFE');
-		}
-		else if (applied === null || applied === undefined) {
-			running = false;
-			color = 'var(--text-color-low,#999)';
-			label = _('UNKNOWN');
-		}
-		else if (applied === 0) {
-			running = false;
-			color = 'var(--text-color-medium,#888)';
-			label = _('STOPPED');
-		}
-		else {
-			running = true;
-			color = 'var(--h5fc-ok,#36c98f)';
-			label = pct + '%';
-		}
+				Object.keys(OPTIONS).forEach(L.bind(function(key) {
+					this.values[key] = OPTIONS[key].def;
+				}, this));
 
-		box.className = 'h5fc-card h5fc-fanbox' + (running ? ' h5fc-fan-run' : '');
-		svg.style.color = color;
-		var blades = document.getElementById('h5fc-fan-blades');
-		if (blades && running && pct !== null) {
-			/* purely illustrative pace, not an RPM reading */
-			blades.style.animationDuration = (4.2 - 3.2 * clamp(pct, 5, 100) / 100).toFixed(2) + 's';
-		}
-		this.setText('h5fc-fan-label', label);
-		svg.setAttribute('aria-label', _('Fan illustration: %s, driven at %s').format(
-			label === '\u2014' ? _('unknown') : label,
-			applied === null || applied === undefined ? _('unknown output') : fmtPwm(applied)
-		));
+				this.rebuildWidgets();
+				this.editorFromSpec(OPTIONS.curve_custom.def);
+				this.markDirty();
+				this.notify(_('Defaults loaded into the form. Save to store them.'), 'info');
+				return null;
+			}, this));
 	},
 
-	updateGauge: function(id, sensor, bands, control) {
-		var box = document.getElementById('h5fc-gauge-' + id);
-		if (!box)
-			return;
-		var temp = sensor ? sensor.temp_c : null;
-		var band = bandOf(bands, temp);
-		var svg = document.getElementById('h5fc-gauge-' + id + '-svg');
-		if (svg) {
-			/* scale: -10..110 -> 0..100% */
-			var pct = (temp === null) ? 0 : clamp((temp + 10) * 100 / 120, 0, 100);
-			var angle = Math.PI * (1 - pct / 100);
-			var ex = 100 + 78 * Math.cos(angle), ey = 96 - 78 * Math.sin(angle);
-			var arc = document.getElementById('h5fc-gauge-' + id + '-svg-arc');
-			if (arc) {
-				arc.setAttribute('d', 'M22 96 A78 78 0 0 1 ' + ex.toFixed(1) + ' ' + ey.toFixed(1));
-				var color = band ? { ok: 'var(--h5fc-ok,#36c98f)', warn: 'var(--h5fc-amber,#f0aa46)', hot: 'var(--h5fc-red,#ef6262)', crit: 'var(--h5fc-red,#ef6262)' }[band.cls] : 'rgba(127,127,127,.3)';
-				arc.setAttribute('stroke', color);
-				arc.setAttribute('opacity', temp === null ? '.25' : '.95');
-			}
-			this.setText('h5fc-gauge-' + id + '-svg-val', temp === null ? '\u2014' : String(temp));
-			svg.setAttribute('aria-label', temp === null ? _('Temperature unknown') : _('%d degrees Celsius, %s').format(temp, band ? band.label : ''));
-		}
-		var bandEl = document.getElementById('h5fc-gauge-' + id + '-band');
-		if (bandEl) {
-			bandEl.className = 'h5fc-badge ' + (band ? band.cls === 'ok' ? 'ok' : band.cls === 'warn' ? 'warn' : 'fail' : 'mute');
-			bandEl.style.fontSize = '10px';
-			bandEl.textContent = band ? band.label : _('No data');
-		}
-		this.setText('h5fc-gauge-' + id + '-src', sensor ? this.sourceName(sensor.source) + (sensor.label ? ' \u00b7 ' + sensor.label : '') : '\u2014');
-		var isControl = control && control.label && sensor && sensor.label === control.label;
-		box.classList.toggle('active', !!isControl);
+	resetCustomCurve: function() {
+		this.editorFromSpec(OPTIONS.curve_custom.def);
+		this.notify(_('The default custom curve was loaded into the editor. Save to store it.'), 'info');
 	},
 
-	/* ----------------------------------------------------------- *
-	 * widget state refresh (after load/reset)                     *
-	 * ----------------------------------------------------------- */
+	rebuildWidgets: function() {
+		Object.keys(OPTIONS).forEach(L.bind(function(key) {
+			this.syncWidget(key);
+		}, this));
 
-	rebuildStaticWidgets: function() {
-		var el;
-		el = document.getElementById('h5fc-enabled');
-		if (el)
-			el.checked = this.values.enabled === '1';
-		this.checkSegmented('h5fc-mode', this.values.mode);
-		this.checkSegmented('h5fc-source', this.values.temp_source);
-		this.checkSegmented('h5fc-curve-profile', this.values.curve);
-		this.syncManualSlider();
-		this.updateModeVisibility();
-		['interval', 'hysteresis', 'down_delay', 'start_pwm', 'start_boost_ms', 'fail_pwm'].forEach(function(key) {
-			var input = document.getElementById('h5fc-set-' + key);
-			if (input) {
-				input.value = this.values[key];
-				input.classList.remove('err');
-			}
-		}, this);
-		this.rebuildCurveEditor();
-		this.drawCurveChart();
+		this.renderPresets();
+		this.syncCurvePreview();
 	},
 
-	checkSegmented: function(id, value) {
-		var inputs = document.querySelectorAll('#' + id + ' input[type=radio]');
-		for (var i = 0; i < inputs.length; i++)
-			inputs[i].checked = inputs[i].value === value;
-	},
+	confirm: function(message) {
+		var messages = Array.prototype.slice.call(arguments).filter(Boolean);
 
-	syncManualSlider: function() {
-		var range = document.getElementById('h5fc-manual-range');
-		var number = document.getElementById('h5fc-manual-number');
-		var v = clamp(parseInt(this.values.manual_pwm, 10) || 0, 0, 255);
-		if (range)
-			range.value = v;
-		if (number)
-			number.value = v;
-	},
+		if (!messages.length)
+			return Promise.resolve(true);
 
-	wireManualSlider: function() {
-		/* One-time two-way binding between slider and number input. */
-		var self = this;
-		var range = document.getElementById('h5fc-manual-range');
-		var number = document.getElementById('h5fc-manual-number');
-		if (!range || !number || range.dataset.h5fcWired)
-			return;
-		range.dataset.h5fcWired = '1';
-		var sync = function(value, source) {
-			var v = clamp(parseInt(value, 10) || 0, 0, 255);
-			if (source !== range)
-				range.value = v;
-			if (source !== number)
-				number.value = v;
-			self.setValue('manual_pwm', String(v));
-		};
-		range.addEventListener('input', function(ev) { sync(ev.target.value, range); });
-		number.addEventListener('input', function(ev) {
-			var valid = validateOption('manual_pwm', ev.target.value) === true;
-			number.classList.toggle('err', !valid);
-			if (valid)
-				sync(ev.target.value, number);
+		/*
+		 * Built on ui.showModal rather than ui.confirm: this is the dialog the
+		 * released page already uses, so the button wiring is known to work on
+		 * the LuCI build the H5000M ships.
+		 */
+		return new Promise(function(resolve) {
+			ui.showModal(_('Please confirm'), [
+				E('div', { 'style': 'margin-bottom:12px;line-height:1.6' },
+					messages.map(function(text) {
+						return E('p', {}, [ text ]);
+					})),
+				E('div', { 'class': 'right' }, [
+					E('button', {
+						'class': 'btn',
+						click: function() {
+							ui.hideModal();
+							resolve(false);
+						}
+					}, [ _('Cancel') ]),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-positive important',
+						click: function() {
+							ui.hideModal();
+							resolve(true);
+						}
+					}, [ _('Continue') ])
+				])
+			]);
 		});
 	},
 
-	updateModeVisibility: function() {
-		var manualRow = document.getElementById('h5fc-manual-row');
-		if (manualRow)
-			manualRow.style.opacity = (this.values.mode === 'manual' && this.values.enabled === '1') ? '1' : '.5';
-		var editor = document.getElementById('h5fc-curve-editor');
-		if (editor)
-			editor.style.opacity = (this.values.curve === 'custom') ? '1' : '.45';
+	notify: function(messages, type) {
+		var list = (Array.isArray(messages) ? messages : [ messages ]).filter(Boolean);
+
+		ui.addNotification(null, E('div', {}, list.map(function(text) {
+			return E('p', {}, [ text ]);
+		})), type || 'info');
+	},
+
+	handleSave: function(ev) {
+		return this.commit(false, ev);
+	},
+
+	handleSaveApply: function(ev) {
+		return this.commit(true, ev);
+	},
+
+	commit: function(applyNow, ev) {
+		var self = this, problems = this.validateAll(), dirty = this.dirtyKeys(), risky = this.riskyWarnings();
+
+		if (ev)
+			ev.preventDefault();
+
+		if (problems.length) {
+			this.notify([ _('Nothing was saved. Please correct:') ].concat(problems), 'danger');
+			return Promise.resolve();
+		}
+
+		var proceed = risky.length ? this.confirm(risky.join('\n')) : Promise.resolve(true);
+
+		return proceed.then(function(confirmed) {
+			if (!confirmed) {
+				self.notify(_('Saving cancelled; your input is still in the form.'), 'warning');
+				return null;
+			}
+
+			if (!dirty.length) {
+				if (!applyNow) {
+					self.notify(_('No changes to save.'), 'info');
+					return null;
+				}
+
+				return self.runApply().then(function() {
+					self.notify(_('Configuration unchanged; one control cycle ran.'), 'info');
+				});
+			}
+
+			return self.writeUci(applyNow, dirty);
+		});
+	},
+
+	riskyWarnings: function() {
+		var warnings = [];
+
+		if (this.original.enabled === '1' && this.values.enabled === '0')
+			warnings.push(_('The enhanced controller will be disabled and the fan will follow the kernel thermal policy only. Continue?'));
+
+		if (this.values.mode === 'manual' && isUInt(this.values.manual_pwm)) {
+			var value = parseInt(this.values.manual_pwm, 10);
+
+			if (value === 0)
+				warnings.push(_('Manual output 0 commands the fan to stop. Temperatures will rise; the kernel floor may still raise the output. Continue?'));
+			else if (value < 80)
+				warnings.push(_('Manual output below 80/255 often cannot keep the fan spinning under load. Continue?'));
+		}
+
+		if (this.values.mode === 'auto' && this.values.curve === 'custom' && parseCurve(this.values.curve_custom).error)
+			warnings.push(_('The custom curve is not usable, so the controller would run its failsafe output continuously. Continue?'));
+
+		return warnings;
+	},
+
+	policyChanged: function(dirty) {
+		return dirty.some(function(key) {
+			return POLICY_KEYS.indexOf(key) > -1;
+		});
+	},
+
+	writeUci: function(applyNow, dirty) {
+		var self = this, key;
+
+		if (!uci.get(CFG, SID))
+			uci.add(CFG, 'settings', SID);
+
+		for (key in OPTIONS)
+			uci.set(CFG, SID, key, String(this.values[key]));
+
+		return uci.save().then(function() {
+			return uci.apply();
+		}).then(function() {
+			for (key in OPTIONS)
+				self.original[key] = String(self.values[key]);
+
+			self.markDirty();
+
+			if (!applyNow) {
+				self.notify(_('Settings saved. The controller picks them up within one control interval.'), 'info');
+				return self.refresh();
+			}
+
+			if (!self.policyChanged(dirty)) {
+				self.notify(_('Settings saved; no control-relevant value changed.'), 'info');
+				return self.refresh();
+			}
+
+			return self.runApply().then(function() {
+				self.notify(_('Settings saved and applied.'), 'info');
+				return self.refresh();
+			});
+		}).catch(function(err) {
+			self.notify(_('Saving failed: %s').format((err && err.message) ? err.message : err), 'danger');
+			throw err;
+		});
+	},
+
+	handleReset: function() {
+		var self = this;
+
+		return uci.unload(CFG).then(function() {
+			return uci.load(CFG);
+		}).then(function() {
+			self.readStoredConfig();
+			self.rebuildWidgets();
+			self.editorFromSpec(self.values.curve_custom);
+			self.markDirty();
+			self.notify(_('Unsaved changes were discarded.'), 'info');
+			self.paint();
+		}, function(err) {
+			self.notify(_('The configuration could not be reloaded: %s').format((err && err.message) ? err.message : err), 'danger');
+		});
+	},
+
+	runApply: function() {
+		var self = this;
+
+		return fs.exec(APPLY_CMD, [ 'apply' ]).then(function(result) {
+			if (result && result.code !== 0)
+				throw new Error(String(result.stderr || '').trim() || _('the controller reported a failure'));
+
+			return result;
+		}).catch(function(err) {
+			self.notify(_('Applying failed: %s').format(err.message || err), 'danger');
+			throw err;
+		});
 	}
 });
