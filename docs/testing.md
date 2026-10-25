@@ -31,7 +31,7 @@ GitHub Actions 的 `ci.yml` 就是上面这些，分成 `rust`、`frontend`、`r
 
 ## 覆盖内容
 
-### `src/`（109 个单元测试 + 39 个回归测试）
+### `src/`（115 个单元测试 + 39 个回归测试）
 
 | 位置 | 覆盖 |
 |---|---|
@@ -39,6 +39,7 @@ GitHub Actions 的 `ci.yml` 就是上面这些，分成 `rust`、`frontend`、`r
 | `config.rs` | 出厂默认值、`off`→`kernel`、限幅并记录 issue、曲线选择、失效保护下限、策略指纹 |
 | `uci.rs` | 命名/匿名段、引号与转义、`list`、重复选项、未知指令只告警 |
 | `sensor.rs` | 毫度换算、−40…150 区间、畸形值、厂商报文解析（含第二个 `=`、首行优先、>125 拒绝）、模组缓存四舍五入 |
+| `modem.rs` | mt5700 RPC 应答 `data` 字段提取（含转义）、12 路结温取最高（65535 失败值与越界剔除）、缓存原子写、30 秒节流与 0 端口禁用、模拟管理器端到端 |
 | `safety.rs` | 设备树大端属性读取、档位 >255 拒绝、所有权字符串、遗留 `user_space` 恢复（含越界路径不写入）、governor 被接管时判定保护不完整 |
 | `state.rs` | 快照往返、缺失/垃圾字段保持未知、2.x 快照仍可读、重复键、陈旧判定、换行不能伪造新字段 |
 | `controller.rs` | 三模式、滞回、降速延迟、失效保护不受延迟影响、下限抬高、控制来源透传 |
@@ -57,7 +58,7 @@ GitHub Actions 的 `ci.yml` 就是上面这些，分成 `rust`、`frontend`、`r
 - 另一个存活控制器持锁时，`apply` 只写唤醒标记、返回 `queued`、**不碰寄存器**。
 - 拔掉 PWM 节点后：`status` 明确报 `pwm-missing`，`apply` 退出码非 0。
 
-### `tests/frontend-smoke.js`（220 项）
+### `tests/frontend-smoke.js`（298 项）
 
 浏览器忠实的 DOM 桩：`document.createElement()` 得到的是 **xhtml 命名空间**元素，
 只有 `createElementNS(SVG_NS, …)` 才是真 SVG 元素——正是此前「图表全空白却通过断言」
@@ -66,13 +67,16 @@ GitHub Actions 的 `ci.yml` 就是上面这些，分成 `rust`、`frontend`、`r
 - 风扇/曲线/仪表/温度条全部是真 SVG 子节点（逐个 `namespaceURI` 断言）。
 - 没有节点被搬进第二个父节点（同节点复用的隐性 bug）。
 - 六个 TAB、只有一个选中、面板切换、localStorage 与 `location.hash` 记忆。
+- 涡轮风扇图：八叶转子共享模板引用、进度环锚点随输出移动、状态胶囊文案。
 - 未知读数不画数值、过期传感器画斜线占位、无测速时不出现任何 RPM 数字。
 - 曲线标记 `61 °C · 66%` 与后端逐度插值一致；越界输入在保存前被拦下。
+- 保存只暂存 UCI（不自带应用按钮）、无测速时不渲染转速卡片。
 - 样式表不含 `backdrop-filter`，根节点钉住层叠上下文（不遮挡主题导航）。
 - 轮询节奏 5 秒，与控制器 `interval` 解耦。
 
 **反向验证**：把 SVG 辅助函数退回朴素的 `document.createElement` 后重跑，
-182/220 项失败；改回后 220/220 通过。同理，把内核下限钳制改成 `if false`
+绝大多数断言失败（220 项时代实测 182 项；现测试集 298 项，断言密度只增不减）；
+改回后全数通过。同理，把内核下限钳制改成 `if false`
 后新增的 `automatic_control_never_undercuts_the_kernel_floor_end_to_end`
 立即失败。桩件不放宽于真实运行时。
 
@@ -94,29 +98,34 @@ GitHub Actions 的 `ci.yml` 就是上面这些，分成 `rust`、`frontend`、`r
 把补丁里的 `/delete-node/ cpu-passive` 改成 `cpu-thermal` → 报不是风扇档位；
 往补丁里加一行删除 → 报「removes 1 lines」。三处都按预期失败后才保留该检查。
 
-## 已在真机之外验证到的东西- `aarch64-unknown-linux-musl` 交叉编译产出 `ELF 64-bit LSB executable, ARM aarch64,
-  version 1 (SYSV), statically linked, stripped`，约 580 KB，`ldd` 报「not a dynamic
-  executable」。
-- 发布脚本会解开生成的 APK/IPK，确认包内二进制确实是静态 aarch64，而不是宿主机产物。
-- `shellcheck` 与 `jq` 由 CI 安装后执行（`frontend` job 的 `Install validation tools`）；
-  宿主没有这两个工具时，本地一键执行里对应步骤会跳过或报 command not found，
-  不代表检查通过。
+## 已在 H5000M 实机验证（2026-10-25/26，ImmortalWRT SNAPSHOT / Aurora 主题）
 
-## 仍未验证（需要 H5000M 实机）
+- 从 2.1.0 → 3.0.0 → 3.2.0 原地升级：`uci-defaults` 幂等迁移（schema v2/v3，
+  用户设置保留）、apk 签名公钥导入、服务无停机接管。
+- 六标签页实机渲染与交互：三卡片概览（涡轮风扇图、输出仪表、状态卡含控制
+  温度/归因）、温度带五传感器（CPU/PHY/双射频/5G 模组）、LuCI 原生未保存
+  更改指示器的暂存与应用。
+- 5G 模组温度桥接：`/var/run/mt5700m/temperature` 30 秒节流写入，模组传感器
+  在状态契约与温度页实时显示。
+- 自动模式控制循环：多传感器取最大、目标/请求/寄存器回读一致、降速延迟、
+  内核下限并列展示、logread 控制事件按 5 秒周期落盘。
 
-以下为**尚未在真机上验证**的项目，不应被当作已完成：
+`aarch64-unknown-linux-musl` 交叉编译产出 `ELF 64-bit LSB executable, ARM aarch64,
+version 1 (SYSV), statically linked, stripped`，约 580 KB，`ldd` 报「not a dynamic
+executable」；发布脚本会解开生成的 APK/IPK，确认包内二进制确实是静态 aarch64，
+而不是宿主机产物。`shellcheck` 与 `jq` 由 CI 安装后执行（`frontend` job 的
+`Install validation tools`）；宿主没有这两个工具时，本地一键执行里对应步骤会
+跳过或报 command not found，不代表检查通过。
 
-1. 页面在设备 LuCI 主题（含深色）下的实际视觉效果、移动端是否横向溢出、
-   六 TAB 的高度与留白 —— 需要真机浏览器目视确认。
-2. 厂商 `iwpriv ra0/rai0 stat` 在真实 mt_wifi 驱动上的输出格式与耗时（当前仅有
-   有界超时与降级路径的模拟测试）。
-3. `/var/run/mt5700m/temperature` 在实机上的写入频率与新鲜度是否满足默认 60 秒。
-4. 真实设备树 `pwm-fan/cooling-levels` 与 cooling-maps 的 phandle 匹配结果
-   （模拟测试按常见布局构造）。
-5. 长时间运行下的转速读数（`fanN_input` 是否存在取决于固件）。
-6. 从 2.1.1 的 shell 控制器原地升级到本版本时，procd 换进程瞬间的 PWM 连续性。
+## 仍建议长期观察（未充分覆盖）
 
-设备验证建议顺序：先 `status live` 与 `thermal.protections` 只读确认 →
-备份 `/etc/config/h5000m_fancontrol` → 装包 → `restart` → 依次验证三模式切换、
-曲线生效、配置持久化、安全降级（拔传感器读数的等价手法：把
-`H5000M_FAN_MT5700M_TEMP_MAX_AGE` 调小观察 failsafe）。
+1. 连续多日运行的稳定性与内存占用（目前验证窗口为数小时）。
+2. 真实传感器故障下的失效保护路径（拔风扇/传感器读数的等价手法：
+   把 `H5000M_FAN_MT5700M_TEMP_MAX_AGE` 调小观察 failsafe，仅离线演练过）。
+3. 厂商 `iwpriv ra0/rai0 stat` 在真实 mt_wifi 驱动上的输出格式与耗时（实机
+   温度来自 hwmon，厂商回退路径未被真实触发）。
+4. 真实设备树 `pwm-fan/cooling-levels` 与 cooling-maps 的 phandle 匹配——
+   实机当前走 conservative fallback 阈值下限（设备树未声明 cooling-maps）。
+5. 极端高温场景下 83/113 °C 紧急档的真实触发。
+6. 转速读数：本机型固件未提供 `fanN_input`，`fan.rpm` 契约字段长期为 `null`
+   （界面已按"无转速卡"设计）。

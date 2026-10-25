@@ -58,6 +58,14 @@ ls -l /var/run/mt5700m/temperature
 - 5G 模组：读 `/var/run/mt5700m/temperature` 的 `temperature=` 与 `updated=`；
   超过 `H5000M_FAN_MT5700M_TEMP_MAX_AGE`（默认 60 秒）即判为过期，回退扫描
   `/tmp/cache_base_info_*`、`/tmp/cache_*info*`。**过期与缺失都不会被当成 0 °C**。
+- 模组温度一直缺失时，按顺序检查：
+  1. `ls /var/run/mt5700m/` —— 目录都不存在说明桥接还没写过一次；
+  2. `pgrep at-webserver-rust` —— 5G 模组管理器（luci-app-mt5700）必须在线，
+     控制器经它的 RPC（`127.0.0.1:$H5000M_FAN_MT5700M_RPC_PORT`，默认 8765）
+     发 `AT^CHIPTEMP?`；管理器未运行时模组传感器保持"缺失"，不影响其他传感器；
+  3. 手工验证通道：`echo '{"id":1,"method":"at","params":{"cmd":"AT^CHIPTEMP?"}}' |
+     nc 127.0.0.1 8765` 应返回 `^CHIPTEMP:` 开头的 12 个 0.1 ℃ 读数；
+  4. 端口非默认时用 `H5000M_FAN_MT5700M_RPC_PORT` 覆盖，设为 `0` 关闭桥接。
 - 全部不可用时控制器会输出 `fail_pwm`（默认 255）散热，这是有意为之。
 
 ## 风扇转速和设定值不一致

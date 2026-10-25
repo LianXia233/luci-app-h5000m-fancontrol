@@ -12,13 +12,30 @@ CPU 降频、高温及临界过热保护。
 > temperature-aware profiles, manual PWM, hysteresis, delayed spin-down, start
 > boost and sensor failsafe — the kernel's thermal protection stays intact.
 
-![散热管理界面（2.x 截图）](docs/fan-control-ui.jpg)
+![散热管理界面（3.2.0 实机截图）](docs/fan-control-ui.png)
 
-*上图为 2.x 界面截图，仅用于说明功能范围。3.0.0 的六 TAB 界面尚未在设备真机上截图，
-不在这里冒充新版视觉稿。*
+*上图为 3.2.0 在 H5000M 实机上的概览页截图：拟物涡轮风扇图、270° 进度环、
+输出仪表与寄存器回读、状态卡（含控制温度与控制归因）、全传感器温度带
+（含来自 mt5700 管理器桥接的 5G 模组温度）。底部的"保存并应用 / 保存 / 重置"
+是 LuCI 原生的未保存更改指示器，插件不再自带保存按钮。*
 
 版本采用 `主版本.次版本.修订版本-r打包修订`。GitHub Release 使用语义版本标签
-（当前 `v3.0.0`），OpenWrt 安装包版本为 `3.0.0-r1`。
+（当前 `v3.2.0`），OpenWrt 安装包版本为 `3.2.0-r1`。
+
+## 3.2.0 变更要点
+
+- **5G 模组温度接入**。守护进程通过本机 `luci-app-mt5700` 管理器的 RPC
+  节流查询 `AT^CHIPTEMP?`（默认 30 秒一查，60 秒新鲜度），取 12 路结温中
+  有效读数的最高值写入 `/var/run/mt5700m/temperature`；串口仍由管理器独占，
+  管理器缺席时模组传感器照常报告缺失。
+- **保存走 LuCI 原生流程**。页面移除自带的保存/保存并应用/恢复按钮：修改先
+  暂存 UCI，由原生"未保存的更改"指示器负责提交、回滚保护与服务通知；
+  控制器监听配置文件变化自动生效，"立即应用"按钮保留用于即时生效。
+- **界面重绘**。风扇图与曲线图换为拟物渐变风格的原生 SVG（八叶涡轮、270°
+  进度环、随输出变速的转子、曲线下方面积、上下限行内标注、光标束与悬浮
+  读数胶囊），动画尊重 `prefers-reduced-motion`。
+- **概览排版修正**。补齐缺失的 `span3` 栅格定义，状态卡收纳控制温度与
+  控制归因，卡片末行统计撑满剩余高度；移除本机型给不出的转速反馈卡片。
 
 ## 3.0.0 变更要点
 
@@ -43,8 +60,8 @@ CPU 降频、高温及临界过热保护。
 
 ## 功能
 
-- 汇总 CPU、以太网 PHY、Wi-Fi 射频及 MT5700M 管理器缓存温度，原生读数优先，
-  MTK 厂商驱动 `iwpriv` 有界超时回退
+- 汇总 CPU、以太网 PHY、Wi-Fi 射频及 5G 模组温度，原生读数优先，模组温度经
+  mt5700 管理器 RPC 桥接自缓存，MTK 厂商驱动 `iwpriv` 有界超时回退
 - 静音、均衡、性能和自定义四种自动曲线（自定义曲线保存前校验并线性插值）
 - 自动、手动和仅内核保护三种运行模式
 - 温度滞回及降速延迟，减少风扇频繁波动
@@ -52,6 +69,7 @@ CPU 降频、高温及临界过热保护。
 - 传感器或曲线异常时自动进入高输出安全模式
 - 读取设备树 `pwm-fan` 冷却档位与 cooling-maps，计算内核安全下限，同时展示
   实际输出与目标输出
+- 配置修改走 LuCI 原生未保存更改流程（暂存 → 原生应用/回滚）
 - 简体中文 LuCI 界面
 - 不依赖云服务，不收集或上传设备数据
 
@@ -69,16 +87,20 @@ CPU 降频、高温及临界过热保护。
 
 从 GitHub Releases 下载与设备 ABI 一致的近期 SNAPSHOT `mediatek/filogic` APK
 （应用包与 `luci-i18n-h5000m-fancontrol-zh-cn` 语言包），连同 `SHA256SUMS`、
-`BUILD-INFO.txt` 与公钥一起放到设备上后校验并安装：
+`BUILD-INFO.txt` 与本次构建的公钥一起放到设备上后校验并安装。每次发布由 SDK
+现场生成签名密钥，安装前先把发布页的 `openwrt-sdk-build.pem` 放进
+`/etc/apk/keys/`（文件名随意，如 `h5000m-build.pem`）：
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing
-apk add --allow-untrusted --keys-dir /etc/apk/keys luci-app-h5000m-fancontrol-3.0.0-r1.apk
+cp openwrt-sdk-build.pem /etc/apk/keys/h5000m-build.pem
+apk add luci-app-h5000m-fancontrol-3.2.0-r1.apk luci-i18n-h5000m-fancontrol-zh-cn-*.apk
 ```
 
-发布页同时提供 SDK 校验值、源码提交与公钥，包由 SDK 自带的 `apk adbsign` 签名并用
-`apk verify` 严格验签后才上传；私钥不进入仓库与发布产物。构建过程与密钥处理见
-[docs/build.md](docs/build.md)。
+不导入公钥时也可以用 `apk add --allow-untrusted` 安装（本地校验由
+`SHA256SUMS` 承担）。发布页同时提供 SDK 校验值、源码提交与公钥，包由 SDK
+自带的 `apk adbsign` 签名并用 `apk verify` 严格验签后才上传；私钥不进入仓库
+与发布产物。构建过程与密钥处理见 [docs/build.md](docs/build.md)。
 
 ### 集成到 OpenWrt 源码
 
@@ -156,15 +178,27 @@ h5000m-fancontrol release         # 恢复遗留 thermal policy
 
 ## 验证状态
 
-离线验证全部通过：`cargo fmt`/`clippy -D warnings`、109 个单元测试 + 39 个回归测试、
-前端渲染冒烟（220 项）、状态契约与遗留输出测试、UCI 迁移测试、打包守卫、内核热保护
+离线验证全部通过：`cargo fmt`/`clippy -D warnings`、115 个单元测试 + 39 个回归测试、
+前端渲染冒烟（298 项）、状态契约与遗留输出测试、UCI 迁移测试、打包守卫、内核热保护
 红线守卫（含反向验证）、shellcheck、语言包完整性审计、aarch64 musl 静态交叉编译。
 细节见 [docs/testing.md](docs/testing.md)。
 
-**尚未在 H5000M 实机验证**（模拟测试通过不等于实机认证）：真机界面视觉与移动端布局、
-真实 `iwpriv` 输出格式与耗时、MT5700M 温度缓存新鲜度、真实设备树 phandle 匹配、
-长时间运行的转速读数可用性、以及从 2.1.1 shell 控制器原地升级换进程瞬间的 PWM 连续性。
-完整清单与推荐验证顺序在 [docs/testing.md](docs/testing.md) 末节。
+以下内容已在 H5000M 实机验证（2026-10-25/26，ImmortalWRT SNAPSHOT）：
+
+- 从 2.1.0 与 3.0.0 原地升级到 3.2.0：配置幂等迁移（schema v2/v3 → 用户设置保留）、
+  服务无停机接管；
+- 六标签页在设备 LuCI（Aurora 主题）下的实机渲染与交互、三卡片概览布局、
+  涡轮风扇图与曲线图动画；
+- 5G 模组温度桥接：30 秒节流自缓存写入 `/var/run/mt5700m/temperature`，
+  温度页实时显示模组读数；
+- 自动模式控制循环：多传感器取最大值、目标/请求/回读三级输出一致、
+  降速延迟与内核下限并列展示；
+- LuCI 原生未保存更改流程下的配置暂存与生效。
+
+仍建议长期观察（尚未覆盖）：连续多日运行稳定性、真实传感器故障下的失效保护路径、
+厂商 `iwpriv` 回退在真实 mt_wifi 驱动上的输出格式、长时间运行下的转速读数可用性
+（本机型固件未提供 `fanN_input`）。完整清单与推荐验证顺序在
+[docs/testing.md](docs/testing.md) 末节。
 
 ## 文档
 

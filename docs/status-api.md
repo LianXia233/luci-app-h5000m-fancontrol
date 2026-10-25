@@ -111,7 +111,7 @@
 | `applied_pwm` | int | 控制器上次写入后回读的值 |
 | `requested_percent` / `target_percent` / `applied_percent` | int 0–100 |
 | `rpm` | int \| null | 转速，仅当硬件提供测速节点 |
-| `rpm_available` | bool | 为 `false` 时前端必须显示「无转速反馈」，不得给出推算值 |
+| `rpm_available` | bool | 为 `false` 时不得给出推算值；自 3.2.0 起界面不再渲染转速卡片，字段仅为脚本保留 |
 | `fan_path` | string \| null | 测速节点路径 |
 | `reason` | string | 见下表 |
 | `reason_code` | string | 去掉 `+kernel-floor` 后缀的基础原因 |
