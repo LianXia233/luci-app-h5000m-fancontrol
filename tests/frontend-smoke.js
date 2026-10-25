@@ -584,12 +584,7 @@ async function main() {
 	view.values.manual_pwm = '300';
 	check('manual pwm beyond 255 is rejected', !!view.validateOption('manual_pwm', false));
 
-	/* Saving must not touch the controller when only non-policy values moved. */
-	view.original = Object.assign({}, view.values);
-	view.values.fail_pwm = '250';
-	check('a policy option change is detected as policy relevant',
-		view.policyChanged(view.dirtyKeys()) === true);
-
+	/* Saving stages UCI changes; the native indicator applies them. */
 	view.original = Object.assign({}, view.values);
 	check('an unchanged form reports no dirty keys', view.dirtyKeys().length === 0);
 

@@ -145,10 +145,6 @@ var OPTIONS = {
 	}
 };
 
-var POLICY_KEYS = Object.keys(OPTIONS).filter(function(key) {
-	return OPTIONS[key].policy;
-});
-
 /* Which stored curve each profile uses, mirroring config::curve_spec(). */
 var CURVE_OPTION = {
 	silent: 'curve_silent',
@@ -1047,7 +1043,6 @@ return view.extend({
 			'.h5fan-health:before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}',
 			'.h5fan-health.is-warn{background:rgba(217,150,63,.15);color:var(--h5fan-amber)}',
 			'.h5fan-health.is-fail{background:rgba(214,91,91,.15);color:var(--h5fan-red)}',
-			'.h5fan-head-actions{display:flex;flex-wrap:wrap;gap:7px;margin-left:auto}',
 			'.h5fan-banner{display:none;margin:0 0 12px;padding:11px 13px;font-size:12.5px;line-height:1.5;color:var(--h5fan-red);background:rgba(214,91,91,.08);border-left:3px solid var(--h5fan-red)}',
 			'.h5fan-banner.is-shown{display:block}',
 			'.h5fan-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px;padding:5px}',
@@ -1064,7 +1059,7 @@ return view.extend({
 			'.h5fan-span12{grid-column:span 12}.h5fan-span8{grid-column:span 8}.h5fan-span7{grid-column:span 7}',
 			'.h5fan-span6{grid-column:span 6}.h5fan-span5{grid-column:span 5}.h5fan-span4{grid-column:span 4}',
 			'@media(max-width:1000px){.h5fan-span8,.h5fan-span7,.h5fan-span6,.h5fan-span5,.h5fan-span4{grid-column:span 12}}',
-			'@media(max-width:640px){.h5fan-pane{gap:10px}.h5fan-head-actions{margin-left:0;width:100%}.h5fan-head h2{font-size:18px}}',
+			'@media(max-width:640px){.h5fan-pane{gap:10px}.h5fan-head h2{font-size:18px}}',
 			'.h5fan-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:10px}',
 			'.h5fan-kv{padding:11px 12px;display:flex;flex-direction:column;gap:4px;min-width:0}',
 			'.h5fan-kv-label{font-size:11.5px;color:var(--text-color-medium,#666)}',
@@ -1196,24 +1191,17 @@ return view.extend({
 
 	head: function() {
 		var health = E('span', { 'class': 'h5fan-health' }, [ _('Loading…') ]);
-		var actions = E('div', { 'class': 'h5fan-head-actions' });
 
 		this.headHealth = health;
 
-		[
-			[ _('Save'), 'btn', L.bind(this.handleSave, this) ],
-			[ _('Save & Apply'), 'btn cbi-button-positive', L.bind(this.handleSaveApply, this) ],
-			[ _('Revert'), 'btn', L.bind(this.handleReset, this) ]
-		].forEach(L.bind(function(spec) {
-			actions.appendChild(E('button', {
-				'class': spec[1], type: 'button', click: spec[2]
-			}, [ spec[0] ]));
-		}, this));
-
+		/*
+		 * Saving goes through LuCI's own machinery: staged changes surface in
+		 * the native unsaved-changes indicator, whose Apply and Revert buttons
+		 * own the UCI commit, the rollback protection and the service reload.
+		 */
 		return E('div', { 'class': 'h5fan-head' }, [
 			E('h2', {}, [ _('H5000M cooling management') ]),
 			health,
-			actions,
 			E('p', { 'class': 'h5fan-head-sub' }, [
 				_('Balances cooling against noise without touching the kernel CPU throttling, hot or critical protection.')
 			])
@@ -2370,14 +2358,6 @@ return view.extend({
 	},
 
 	handleSave: function(ev) {
-		return this.commit(false, ev);
-	},
-
-	handleSaveApply: function(ev) {
-		return this.commit(true, ev);
-	},
-
-	commit: function(applyNow, ev) {
 		var self = this, problems = this.validateAll(), dirty = this.dirtyKeys(), risky = this.riskyWarnings();
 
 		if (ev)
@@ -2397,17 +2377,11 @@ return view.extend({
 			}
 
 			if (!dirty.length) {
-				if (!applyNow) {
-					self.notify(_('No changes to save.'), 'info');
-					return null;
-				}
-
-				return self.runApply().then(function() {
-					self.notify(_('Configuration unchanged; one control cycle ran.'), 'info');
-				});
+				self.notify(_('No changes to save.'), 'info');
+				return null;
 			}
 
-			return self.writeUci(applyNow, dirty);
+			return self.stageUci(dirty);
 		});
 	},
 
@@ -2432,13 +2406,7 @@ return view.extend({
 		return warnings;
 	},
 
-	policyChanged: function(dirty) {
-		return dirty.some(function(key) {
-			return POLICY_KEYS.indexOf(key) > -1;
-		});
-	},
-
-	writeUci: function(applyNow, dirty) {
+	stageUci: function(dirty) {
 		var self = this, key;
 
 		if (!uci.get(CFG, SID))
@@ -2448,47 +2416,21 @@ return view.extend({
 			uci.set(CFG, SID, key, String(this.values[key]));
 
 		return uci.save().then(function() {
-			return uci.apply();
-		}).then(function() {
 			for (key in OPTIONS)
 				self.original[key] = String(self.values[key]);
 
 			self.markDirty();
 
-			if (!applyNow) {
-				self.notify(_('Settings saved. The controller picks them up within one control interval.'), 'info');
-				return self.refresh();
-			}
-
-			if (!self.policyChanged(dirty)) {
-				self.notify(_('Settings saved; no control-relevant value changed.'), 'info');
-				return self.refresh();
-			}
-
-			return self.runApply().then(function() {
-				self.notify(_('Settings saved and applied.'), 'info');
-				return self.refresh();
-			});
+			/*
+			 * Deliberately no uci.apply() here: committing, the rollback
+			 * window and the service notifications belong to LuCI's native
+			 * unsaved-changes flow. The controller watches the UCI file and
+			 * picks the committed values up without a restart.
+			 */
+			self.notify(_('Changes staged. Apply or discard them with the unsaved-changes indicator.'), 'info');
 		}).catch(function(err) {
 			self.notify(_('Saving failed: %s').format((err && err.message) ? err.message : err), 'danger');
 			throw err;
-		});
-	},
-
-	handleReset: function() {
-		var self = this;
-
-		return uci.unload(CFG).then(function() {
-			return uci.load(CFG);
-		}).then(function() {
-			self.readStoredConfig();
-			self.rebuildWidgets();
-			self.editorFromSpec(self.values.curve_custom);
-			self.markDirty();
-			self.notify(_('Unsaved changes were discarded.'), 'info');
-			self.paint();
-		}, function(err) {
-			self.notify(_('The configuration could not be reloaded: %s').format((err && err.message) ? err.message : err), 'danger');
 		});
 	},
 

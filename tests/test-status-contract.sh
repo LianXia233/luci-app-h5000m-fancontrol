@@ -59,6 +59,9 @@ VIEW='htdocs/luci-static/resources/view/h5000m/fancontrol.js'
 [ -f "${VIEW}" ] || fail 'the LuCI view is missing'
 
 # Every field the page consumes, in contract notation.
+# Fields the controller publishes AND the view consumes. fan.rpm and
+# fan.rpm_available stay published for scripts (guarded by the JSON shape
+# asserts below) but the view no longer shows a tachometer card.
 CONTRACT_FIELDS='
 controller.health
 controller.running
@@ -91,8 +94,6 @@ fan.pwm_value
 fan.requested_pwm
 fan.target_pwm
 fan.applied_pwm
-fan.rpm
-fan.rpm_available
 fan.reason
 fan.kernel_floor_applied
 fan.boost_applied

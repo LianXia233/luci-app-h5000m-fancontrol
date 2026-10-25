@@ -825,3 +825,6 @@ msgstr "目标输出 %d%%"
 
 msgid "Stopped"
 msgstr "已停止"
+
+msgid "Changes staged. Apply or discard them with the unsaved-changes indicator."
+msgstr "修改已暂存。请用页面上的“未保存的更改”指示器来应用或放弃。"
