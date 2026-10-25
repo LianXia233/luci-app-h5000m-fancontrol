@@ -208,7 +208,15 @@ function poEscape(s) {
 }
 
 const header = `msgid ""
-msgstr "Content-Type: text/plain; charset=UTF-8\\n"
+msgstr ""
+"Project-Id-Version: luci-app-h5000m-fancontrol 3.0.0\\n"
+"PO-Revision-Date: 2026-10-25 15:00+0800\\n"
+"Last-Translator: LianXia233\\n"
+"Language-Team: Chinese (simplified)\\n"
+"Language: zh_Hans\\n"
+"MIME-Version: 1.0\\n"
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Content-Transfer-Encoding: 8bit\\n"
 
 `;
 const body = strings.map(s =>

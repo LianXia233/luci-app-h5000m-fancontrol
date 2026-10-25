@@ -5,7 +5,9 @@ const fs = require('fs');
 const text = fs.readFileSync(process.argv[2], 'utf8').replace(/\r\n/g, '\n');
 const entries = text.split('\n\n').map(e => e.trim()).filter(Boolean);
 let bad = 0;
-const entryRe = /^msgid "((?:[^"\\]|\\.)*)"\nmsgstr "((?:[^"\\]|\\.)*)"$/;
+// A single msgid followed by a msgstr; the msgstr may continue on
+// additional quoted lines (the header entry uses that form).
+const entryRe = /^msgid "((?:[^"\\]|\\.)*)"\nmsgstr "((?:[^"\\]|\\.)*)"(?:\n"(?:[^"\\]|\\.)*")*$/;
 for (const entry of entries) {
 	if (!entryRe.test(entry)) {
 		bad++;
