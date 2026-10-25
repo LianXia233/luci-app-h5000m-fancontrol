@@ -27,7 +27,17 @@ write() {
 }
 write_be32() {
 	mkdir -p "$(dirname "$1")"
-	awk "BEGIN { for (i = 2; i < ARGC; i++) printf \"%c%c%c%c\", int(\$i/16777216)%256, int(\$i/65536)%256, int(\$i/256)%256, \$i%256 }" "$@" > "$1"
+	# Write big-endian u32 words. ARGV[1] is the target path, ARGV[2..] the
+	# words. Note: ARGV[i], not $i - a field reference is empty inside BEGIN
+	# and would silently write zero bytes. `exit` keeps awk from trying to
+	# read the target as an input file afterwards. LC_ALL=C keeps %c
+	# byte-oriented: in a UTF-8 locale gawk would emit values >= 128 as
+	# multi-byte UTF-8 (e.g. 160 as c2 a0) and corrupt the fixture.
+	LC_ALL=C awk 'BEGIN {
+		for (i = 2; i < ARGC; i++)
+			printf "%c%c%c%c", int(ARGV[i]/16777216)%256, int(ARGV[i]/65536)%256, int(ARGV[i]/256)%256, ARGV[i]%256
+		exit
+	}' "$@" > "$1"
 }
 
 cat > "$TMP/path/uci" << EOF
