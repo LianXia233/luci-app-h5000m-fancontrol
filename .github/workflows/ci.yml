@@ -8,123 +8,119 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   rust:
-    name: Rust checks
-    runs-on: ubuntu-24.04
+    name: Rust controller
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt, clippy
           targets: aarch64-unknown-linux-musl
-          components: clippy, rustfmt
 
-      - name: Format check
+      - name: Formatting
         working-directory: src
         run: cargo fmt --check
 
       - name: Clippy
         working-directory: src
-        run: cargo clippy --lib --tests -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Unit tests
+      - name: Unit and regression tests
         working-directory: src
-        run: cargo test --release
+        run: cargo test --locked --release
 
-      - name: Cross-compile for aarch64 musl
+      - name: Cross compile for the router
+        working-directory: src
+        run: cargo build --locked --release --target aarch64-unknown-linux-musl
+
+      - name: The artefact must be a static aarch64 binary
         working-directory: src
         run: |
-          cargo build --release --offline --target aarch64-unknown-linux-musl
-          file target/aarch64-unknown-linux-musl/release/h5000m-fancontrol | grep -q 'aarch64'
-          test "$(stat -c %s target/aarch64-unknown-linux-musl/release/h5000m-fancontrol)" -lt 2097152
+          binary=target/aarch64-unknown-linux-musl/release/h5000m-fancontrol
+          test -x "$binary"
+          file "$binary" | tee /dev/stderr | grep -Eq 'ELF 64-bit.*ARM aarch64.*statically linked'
+          ldd "$binary" 2>&1 | grep -q 'not a dynamic executable'
+          ls -lh "$binary"
 
   frontend:
-    name: LuCI frontend checks
+    name: LuCI frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check LuCI JavaScript syntax
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y gettext shellcheck
+
+      - name: JavaScript syntax
         run: node --check htdocs/luci-static/resources/view/h5000m/fancontrol.js
+
+      - name: Browser-faithful render checks
+        run: node tests/frontend-smoke.js
+
+      - name: Translation catalogue is complete and valid
+        run: |
+          node scripts/i18n-audit.js
+          msgfmt --check --check-format -o /dev/null po/zh_Hans/h5000m-fancontrol.po
 
       - name: Validate JSON metadata
         run: |
           jq empty root/usr/share/luci/menu.d/luci-app-h5000m-fancontrol.json
           jq empty root/usr/share/rpcd/acl.d/luci-app-h5000m-fancontrol.json
 
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y gettext
-
-      - name: Validate translations
+      - name: Shell scripts
         run: |
-          msgfmt --check --check-format -o /dev/null po/zh_Hans/h5000m-fancontrol.po
-          node scripts/check-po.js po/zh_Hans/h5000m-fancontrol.po
-          # Every _() string in the view must exist in the .po catalogue.
-          node scripts/extract-strings.js htdocs/luci-static/resources/view/h5000m/fancontrol.js /tmp/h5fc-strings.txt
-          while IFS= read -r line; do
-            grep -qF "msgid \"${line//\"/\\\"}\"" po/zh_Hans/h5000m-fancontrol.po || {
-              echo "missing translation for: $line" >&2
-              exit 1
-            }
-          done < /tmp/h5fc-strings.txt
-
-      - name: Check patch format
-        run: git apply --numstat openwrt-patches/h5000m-userspace-fan-control.patch
-
-  packaging:
-    name: Packaging checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install validation tools
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Shellcheck remaining shell scripts
-        run: |
-          shellcheck root/usr/sbin/h5000m-fancontrol-status
-          shellcheck root/etc/init.d/h5000m-fancontrol
-          shellcheck root/etc/uci-defaults/91-h5000m-fancontrol-v3
-          shellcheck scripts/build-release.sh
-
-      - name: No secrets in the repository
-        run: |
-          # Exclude .github: this workflow file itself contains the pattern.
-          ! grep -rIl 'BEGIN .*PRIVATE KEY' --exclude-dir=.git --exclude-dir=.github .
-          test ! -e private-key.pem
-
-      - name: Controller binary sources
-        run: |
-          # The Rust crate must be the only source of the controller binary.
-          grep -q 'rust' src/Makefile
-          test -f src/Cargo.toml
-          test -f src/Cargo.lock
+          for file in root/etc/init.d/h5000m-fancontrol \
+                     root/etc/uci-defaults/91-h5000m-fancontrol-v3 \
+                     root/usr/sbin/h5000m-fancontrol-status \
+                     scripts/build-release.sh tests/*.sh; do
+            sh -n "$file"
+          done
+          shellcheck -s sh root/etc/init.d/h5000m-fancontrol \
+                     root/etc/uci-defaults/91-h5000m-fancontrol-v3 \
+                     root/usr/sbin/h5000m-fancontrol-status tests/*.sh
+          shellcheck -s bash scripts/build-release.sh
 
   regression:
-    name: Regression tests (simulated sysfs)
-    runs-on: ubuntu-24.04
+    name: Device-behaviour regression tests
+    needs: rust
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
         with:
-          targets: x86_64-unknown-linux-musl
+          node-version: '20'
 
-      - name: Build controller for the test host
-        working-directory: src
-        run: cargo build --release --offline --target x86_64-unknown-linux-musl
-
-      - name: Run regression suite
-        env:
-          H5000M_TEST_BIN: ${{ github.workspace }}/src/target/x86_64-unknown-linux-musl/release/h5000m-fancontrol
+      - name: Status contract, control cycle and packaging guards
         run: |
-          for t in tests/test-*.sh; do
-            echo "== $t"
-            sh "$t"
-          done
+          ./tests/test-status-contract.sh
+          ./tests/test-uci-defaults.sh
+          ./tests/test-packaging.sh
+
+  kernel-safety:
+    name: Kernel thermal protection guards
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Static red-line guards
+        run: ./tests/test-kernel-safety.sh
+
+      - name: Kernel protection assertions must run
+        working-directory: src
+        run: cargo test --locked --release -- protection

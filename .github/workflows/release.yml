@@ -22,6 +22,10 @@ jobs:
         run: |
           version="$(sed -n 's/^PKG_VERSION:=//p' Makefile)"
           test "${GITHUB_REF_NAME}" = "v${version}"
+          # The crate and the package must not drift apart: the controller
+          # reports its own version in the status contract.
+          cargo_version="$(sed -n 's/^version = "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' src/Cargo.toml | head -n 1)"
+          test "${cargo_version}" = "${version}"
       - name: Install build dependencies
         run: |
           sudo apt-get update
