@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>H5000M fan control - frontend harness</title>
+<style>body{font-family:sans-serif;margin:10px;background:#f2f3f5}</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+/* Development-only LuCI environment stub. Loads the real view module and
+ * renders it against a mocked controller status so tab navigation, SVG
+ * widgets and the save pipeline can be exercised in a plain browser.
+ * Not shipped with the package. */
+(function() {
+	'use strict';
+
+	window.__errors = [];
+	window.__uciLog = [];
+	window.__fsLog = [];
+	var origError = console.error;
+	console.error = function() {
+		window.__errors.push(Array.prototype.slice.call(arguments).join(' '));
+		origError.apply(console, arguments);
+	};
+	window.addEventListener('error', function(e) { window.__errors.push(String(e.message)); });
+
+	window.L = { bind: function(fn, ctx) { return fn.bind(ctx); } };
+	window._ = function(s) { return s; };
+
+	if (!String.prototype.format) {
+		String.prototype.format = function() {
+			var args = arguments, i = 0;
+			return this.replace(/%%|%d|%s/g, function(m) {
+				if (m === '%%') return '%';
+				if (m === '%d') return String(Math.round(Number(args[i++])));
+				return String(args[i++]);
+			});
+		};
+	}
+
+	window.E = function(tag, attr) {
+		var children = [], i;
+		/* LuCI's E() allows E('p', 'text') with the text as 2nd argument. */
+		if (typeof attr === 'string' || typeof attr === 'number') {
+			children.push(attr);
+			attr = {};
+		}
+		for (i = 2; i < arguments.length; i++)
+			children.push(arguments[i]);
+		var el = document.createElement(tag);
+		attr = attr || {};
+		Object.keys(attr).forEach(function(key) {
+			var value = attr[key];
+			if (value === null || value === undefined)
+				return;
+			if (key === 'class')
+				el.className = value;
+			else if (typeof value === 'function')
+				el.addEventListener(key, value);
+			else {
+				try { el.setAttribute(key, value); }
+				catch (e) { el[key] = value; }
+			}
+		});
+		var append = function(node) {
+			if (node === null || node === undefined)
+				return;
+			if (Array.isArray(node)) {
+				node.forEach(append);
+				return;
+			}
+			if (typeof node === 'object' && node.nodeType)
+				el.appendChild(node);
+			else
+				el.appendChild(document.createTextNode(String(node)));
+		};
+		children.forEach(append);
+		return el;
+	};
+
+	var now = Math.floor(Date.now() / 1000);
+	var statusCounter = 0;
+	function mockStatus() {
+		statusCounter++;
+		var cpuTemp = 63 + (statusCounter % 3);
+		return {
+			version: '3.0.0-harness',
+			generated: now + statusCounter,
+			source: statusCounter > 2 ? 'snapshot' : 'live',
+			controller: {
+				enabled: true, mode: 'auto', curve: 'balanced', temp_source: 'max',
+				manual_pwm: 160, interval: 5, hysteresis: 2, down_delay: 30,
+				start_pwm: 192, start_boost_ms: 700, fail_pwm: 255,
+				curve_data: '20:0,35:0,40:50,55:60,70:75,85:90,95:100',
+				curve_points: [{ temp: 20, pwm: 0 }, { temp: 35, pwm: 0 }, { temp: 40, pwm: 50 }, { temp: 55, pwm: 60 }, { temp: 70, pwm: 75 }, { temp: 85, pwm: 90 }, { temp: 95, pwm: 100 }],
+				running: true, health: 'ok', result: 'ok', reason: 'auto',
+				last_success: now, last_error: '', state_age: 2
+			},
+			sensors: {
+				cpu: { temp_c: cpuTemp, label: 'soc_thermal', source: 'thermal-zone' },
+				phy: { temp_c: null, label: '', source: 'missing' },
+				wifi1: { temp_c: 61, label: 'mt7996', source: 'hwmon' },
+				wifi2: { temp_c: 57, label: 'MTK radio rai0', source: 'vendor-iwpriv' },
+				module: { temp_c: 44, label: '5G modem', source: 'modem-cache' },
+				control: { temp_c: cpuTemp, label: 'soc_thermal' }
+			},
+			fan: {
+				pwm_path: '/sys/class/hwmon/hwmon0/pwm1', pwm: 165, pwm_percent: 65,
+				requested_pwm: 165, target_pwm: 165, applied_pwm: 165,
+				rpm: null, rpm_path: null, rpm_supported: false
+			},
+			safety: {
+				thermal_floor: 96, thermal_state: 1, thermal_max_state: 3,
+				thermal_owner: 'shared', kernel_policy: 'step_wise',
+				kernel_zone: 'cpu-thermal', cpu_throttling_intact: true,
+				down_delay_active: false
+			}
+		};
+	}
+
+	var mockUci = {
+		data: {
+			settings: {
+				schema_version: '2', enabled: '1', mode: 'auto', curve: 'balanced',
+				temp_source: 'max', manual_pwm: '160', interval: '5', hysteresis: '2',
+				down_delay: '30', start_pwm: '192', start_boost_ms: '700', fail_pwm: '255',
+				curve_silent: '20:0,35:0,40:50,55:50,70:60,85:75,95:100',
+				curve_balanced: '20:0,35:0,40:50,55:60,70:75,85:90,95:100',
+				curve_performance: '20:0,30:60,45:70,60:82,75:92,85:100',
+				curve_custom: '20:0,40:50,55:60,70:75,85:90,95:100'
+			}
+		},
+		load: function() { return Promise.resolve(); },
+		get: function(cfg, sid, opt) {
+			var section = this.data[sid];
+			if (!section)
+				return undefined;
+			return opt === undefined ? 'settings' : section[opt];
+		},
+		add: function() { return 'settings'; },
+		set: function(cfg, sid, opt, value) {
+			window.__uciLog.push(['set', opt, String(value)]);
+			this.data[sid][opt] = String(value);
+			return true;
+		},
+		save: function() { window.__uciLog.push(['save']); return Promise.resolve(); },
+		apply: function() { window.__uciLog.push(['apply']); return Promise.resolve(); },
+		unload: function() { delete this.data.settings; this.data.settings = JSON.parse(JSON.stringify(mockUciDefaults)); return Promise.resolve(); }
+	};
+	var mockUciDefaults = JSON.parse(JSON.stringify(mockUci.data));
+
+	var mockFs = {
+		exec: function(path, args) {
+			window.__fsLog.push([path, (args || []).join(' ')]);
+			if (path === '/usr/sbin/h5000m-fancontrol-status')
+				return Promise.resolve({ code: 0, stdout: JSON.stringify(mockStatus()), stderr: '' });
+			return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+		}
+	};
+
+	var mockPoll = {
+		fns: [],
+		add: function(fn, interval) {
+			var self = this;
+			this.fns.push(fn);
+			setInterval(function() { fn(); }, interval * 1000);
+		}
+	};
+
+	var mockUi = {
+		notifications: [],
+		addNotification: function(cls, children, kind) {
+			var text = children && children.textContent ? children.textContent : String(children);
+			mockUi.notifications.push({ kind: kind || cls || 'info', text: text });
+			var box = document.getElementById('harness-notifications');
+			if (!box) {
+				box = document.createElement('div');
+				box.id = 'harness-notifications';
+				box.style.cssText = 'position:fixed;right:10px;top:10px;z-index:99;max-width:60%;font-size:12px';
+				document.body.appendChild(box);
+			}
+			var note = document.createElement('div');
+			note.style.cssText = 'margin:4px;padding:8px 12px;border-radius:8px;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.2)';
+			note.textContent = '[' + (kind || 'info') + '] ' + text;
+			box.appendChild(note);
+		},
+		showModal: function(title, children) {
+			var old = document.getElementById('harness-modal');
+			if (old)
+				old.remove();
+			var modal = document.createElement('div');
+			modal.id = 'harness-modal';
+			modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:100';
+			var panel = document.createElement('div');
+			panel.style.cssText = 'background:#fff;border-radius:12px;padding:18px;max-width:480px;width:90%';
+			var h = document.createElement('h3');
+			h.textContent = title;
+			panel.appendChild(h);
+			(Array.isArray(children) ? children : [children]).forEach(function(c) { if (c && c.nodeType) panel.appendChild(c); });
+			modal.appendChild(panel);
+			modal.addEventListener('click', function(e) { if (e.target === modal) mockUi.hideModal(); });
+			document.body.appendChild(modal);
+			mockUi.modalOpen = true;
+		},
+		hideModal: function() {
+			var modal = document.getElementById('harness-modal');
+			if (modal)
+				modal.remove();
+			mockUi.modalOpen = false;
+		}
+	};
+
+	var mockView = { extend: function(obj) { return obj; } };
+
+	window.__mocks = { uci: mockUci, fs: mockFs, poll: mockPoll, ui: mockUi, status: mockStatus };
+
+	fetch('../htdocs/luci-static/resources/view/h5000m/fancontrol.js')
+		.then(function(r) { return r.text(); })
+		.then(function(src) {
+			var factory = new Function('view', 'uci', 'fs', 'poll', 'ui', 'E', 'L', '_', src);
+			var viewObj = factory(mockView, mockUci, mockFs, mockPoll, mockUi, window.E, window.L, window._);
+			window.__view = viewObj;
+			return viewObj.load().then(function(data) {
+				var node = viewObj.render(data);
+				document.getElementById('app').appendChild(node);
+				window.__ready = true;
+			});
+		})
+		.catch(function(e) {
+			window.__error = String(e && e.stack || e);
+			document.title = 'HARNESS ERROR';
+		});
+})();
+</script>
+</body>
+</html>
