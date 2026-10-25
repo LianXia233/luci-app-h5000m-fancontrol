@@ -11,6 +11,7 @@
 - 修复测试夹具中 `write_be32` 使用 awk 字段引用 `$i`（BEGIN 中为空）导致设备树属性被写成全零的问题，改用 `ARGV[i]`；并加 `LC_ALL=C` 防止 UTF-8 locale 下 awk `%c` 把 ≥128 的字节编成多字节 UTF-8（如 160 写成 `c2 a0`）而损坏夹具——该问题曾让内核下限测试在 CI 上必然失败。
 - 修复 `src/src/proc.rs` 测试代码使用不稳定特性 `str::as_str()`（`str_as_str`）导致稳定版 clippy 报 E0658 的问题。
 - 修复 CI secrets 检查匹配到工作流自身的 grep 模式导致必然失败的问题（排除 `.github` 目录）。
+- 修复 CI 前端检查在 ubuntu-latest 上因缺少 gettext（`msgfmt: command not found`，退出码 127）而失败的问题：安装 gettext 后再做翻译校验。
 - 修复 shellcheck 警告（init.d 的 rc.common 变量、SHA256SUMS 同文件读写）导致的打包检查失败。
 - 补全 .po 头部字段并更新 check-po.js 以支持多行 msgstr。
 
