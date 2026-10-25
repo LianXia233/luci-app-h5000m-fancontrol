@@ -499,12 +499,18 @@ async function main() {
 	check('the fan diagram says it is not a measured speed',
 		/animation|not a measured/i.test(JSON.stringify(collect(fanSvg[0]).map((n) => n.textContent))));
 
-	const blades = collect(fanSvg[0]).filter((node) => node.tagName === 'PATH'
-		&& String(node.attributes.class || '').indexOf('h5fan-blade') > -1);
+	const blades = collect(fanSvg[0]).filter((node) => node.tagName === 'USE'
+		&& String(node.attributes.href || '').indexOf('#h5fan-blade') > -1);
+	const bladeTemplate = collect(fanSvg[0]).filter((node) => node.tagName === 'PATH'
+		&& node.parentNode && node.parentNode.id === 'h5fan-blade');
 
-	check('the fan rotor has seven blades', blades.length === 7, `found ${blades.length}`);
-	check('every blade is a real SVG path',
-		blades.every((blade) => blade.namespaceURI === SVG_NS && blade.attributes.d));
+	check('the fan rotor has eight blades', blades.length === 8, `found ${blades.length}`);
+	check('every blade instance references the shared turbine blade',
+		blades.every((blade) => blade.namespaceURI === SVG_NS));
+	check('the blade template is drawn with real SVG paths',
+		bladeTemplate.length === 2
+			&& bladeTemplate.every((blade) => blade.namespaceURI === SVG_NS && blade.attributes.d),
+		`found ${bladeTemplate.length}`);
 
 	const curvePaths = collect(chartSvg[0]).filter((node) => node.tagName === 'PATH' && node.attributes.d);
 

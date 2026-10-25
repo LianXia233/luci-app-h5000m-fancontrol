@@ -332,30 +332,121 @@ function tag(text, tone) {
 /* ------------------------------------------------------------------ views */
 
 function mountFanDiagram() {
+	/*
+	 * Geometry of the turbine design: everything is anchored on the rotor
+	 * centre, the 270° progress ring spans 706.86 of the r=150 circumference
+	 * and starts at 135°, so the anchor dot sits at 135° + 2.7° per percent.
+	 */
+	var CX = 210, CY = 195, RING_R = 150, RING_CIRC = 942.48, RING_ARC = 706.86;
 	var blades = [], i;
 
-	for (i = 0; i < 7; i++) {
-		blades.push(svgEl('path', {
-			d: 'M100 100 C 100 60, 130 50, 146 67 C 130 76, 119 88, 117 105 Z',
-			transform: 'rotate(%d 100 100)'.format(i * (360 / 7)),
-			'class': 'h5fan-blade'
-		}));
+	for (i = 0; i < 8; i++) {
+		blades.push(svgEl('use', { href: '#h5fan-blade', transform: 'rotate(%d)'.format(i * 45) }));
 	}
 
-	var rotor = svgEl('g', { 'class': 'h5fan-rotor' }, blades.concat([
-		svgEl('circle', { cx: 100, cy: 100, r: 18, 'class': 'h5fan-hub' })
-	]));
-	var readout = svgEl('text', { x: 100, y: 106, 'class': 'h5fan-fan-num', 'text-anchor': 'middle' }, [ '\u2014' ]);
-	var caption = svgEl('text', { x: 100, y: 192, 'class': 'h5fan-fan-caption', 'text-anchor': 'middle' }, [ _('Loading…') ]);
+	var defs = svgEl('defs', {}, [
+		svgEl('linearGradient', { id: 'h5fan-plate-grad', x1: '0%', y1: '0%', x2: '100%', y2: '100%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#ffffff' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#f1f5f9' })
+		]),
+		svgEl('radialGradient', { id: 'h5fan-tunnel-grad', cx: '50%', cy: '50%', r: '50%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#e0f2fe', 'stop-opacity': '0.6' }),
+			svgEl('stop', { offset: '65%', 'stop-color': '#f8fafc', 'stop-opacity': '0.9' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#e2e8f0', 'stop-opacity': '1' })
+		]),
+		svgEl('linearGradient', { id: 'h5fan-progress-grad', x1: '0%', y1: '100%', x2: '100%', y2: '0%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#38bdf8' }),
+			svgEl('stop', { offset: '50%', 'stop-color': '#0284c7' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#2563eb' })
+		]),
+		svgEl('linearGradient', { id: 'h5fan-blade-grad', x1: '0%', y1: '100%', x2: '100%', y2: '0%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#0284c7', 'stop-opacity': '0.15' }),
+			svgEl('stop', { offset: '55%', 'stop-color': '#38bdf8', 'stop-opacity': '0.55' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#0ea5e9', 'stop-opacity': '0.85' })
+		]),
+		svgEl('linearGradient', { id: 'h5fan-blade-edge', x1: '0%', y1: '0%', x2: '0%', y2: '100%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#bae6fd', 'stop-opacity': '0.9' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#0284c7', 'stop-opacity': '0.2' })
+		]),
+		svgEl('linearGradient', { id: 'h5fan-hub-grad', x1: '0%', y1: '0%', x2: '100%', y2: '100%' }, [
+			svgEl('stop', { offset: '0%', 'stop-color': '#ffffff' }),
+			svgEl('stop', { offset: '100%', 'stop-color': '#cbd5e1' })
+		]),
+		svgEl('g', { id: 'h5fan-blade' }, [
+			svgEl('path', {
+				d: 'M -6,-24 C -36,-54 -26,-102 18,-114 C 30,-117 36,-108 30,-96 C 12,-66 10,-42 20,-22 Z',
+				fill: 'url(#h5fan-blade-grad)', stroke: 'url(#h5fan-blade-edge)', 'stroke-width': '1.5'
+			}),
+			svgEl('path', {
+				d: 'M 2,-26 C -16,-54 -8,-90 22,-106', fill: 'none',
+				stroke: '#e0f2fe', 'stroke-width': '1.2', 'stroke-linecap': 'round', opacity: '0.7'
+			})
+		])
+	]);
+
+	var rotor = svgEl('g', { 'class': 'h5fan-rotor' }, [
+		svgEl('g', { transform: 'translate(%d, %d)'.format(CX, CY) }, blades)
+	]);
+	var airflow = svgEl('g', { 'class': 'h5fan-airflow' }, [
+		svgEl('circle', {
+			cx: CX, cy: CY, r: 92, fill: 'none', stroke: '#38bdf8', 'stroke-width': '1.2',
+			'stroke-dasharray': '18 28 8 22', 'stroke-linecap': 'round', opacity: '0.35'
+		}),
+		svgEl('circle', {
+			cx: CX, cy: CY, r: 64, fill: 'none', stroke: '#0284c7', 'stroke-width': '1',
+			'stroke-dasharray': '12 32', 'stroke-linecap': 'round', opacity: '0.25'
+		})
+	]);
+	var progress = svgEl('circle', {
+		cx: CX, cy: CY, r: RING_R, fill: 'none', 'class': 'h5fan-progress-value',
+		'stroke-width': '8', 'stroke-linecap': 'round',
+		'stroke-dasharray': '0 %s'.format(RING_CIRC),
+		transform: 'rotate(135 %d %d)'.format(CX, CY)
+	});
+	var track = svgEl('circle', {
+		cx: CX, cy: CY, r: RING_R, fill: 'none', stroke: '#e2e8f0', 'stroke-width': '8',
+		'stroke-linecap': 'round', 'stroke-dasharray': '%s %s'.format(RING_ARC, RING_CIRC),
+		transform: 'rotate(135 %d %d)'.format(CX, CY)
+	});
+	var anchor = svgEl('circle', {
+		cx: CX, cy: CY - RING_R, r: 6, fill: '#ffffff', 'class': 'h5fan-progress-anchor',
+		stroke: '#2563eb', 'stroke-width': '3', display: 'none'
+	});
+	var capsuleLabel = svgEl('text', {
+		x: 178, y: 347.5, 'class': 'h5fan-capsule-label'
+	}, [ _('Loading…') ]);
+	var capsuleValue = svgEl('text', {
+		x: 216, y: 348, 'class': 'h5fan-capsule-value'
+	}, [ '\u2014' ]);
+
 	var svg = svgEl('svg', {
-		viewBox: '0 0 200 200', 'class': 'h5fan-fan', role: 'img',
+		viewBox: '0 0 420 420', 'class': 'h5fan-fan', role: 'img',
 		preserveAspectRatio: 'xMidYMid meet', 'aria-label': _('Fan diagram')
 	}, [
 		svgEl('title', {}, [ _('Fan diagram') ]),
 		svgEl('desc', {}, [ _('Schematic fan. The animation follows the applied controller output and is not a measured shaft speed.') ]),
-		svgEl('circle', { cx: 100, cy: 100, r: 90, 'class': 'h5fan-housing' }),
-		svgEl('circle', { cx: 100, cy: 100, r: 78, 'class': 'h5fan-shroud' }),
-		rotor, readout, caption
+		defs,
+		svgEl('circle', { cx: CX, cy: CY, r: 168, fill: 'url(#h5fan-plate-grad)', stroke: '#ffffff', 'stroke-width': '2' }),
+		track,
+		progress,
+		anchor,
+		svgEl('circle', { cx: CX, cy: CY, r: 130, fill: 'url(#h5fan-tunnel-grad)', stroke: '#cbd5e1', 'stroke-width': '1', 'stroke-opacity': '0.6' }),
+		svgEl('circle', { cx: CX, cy: CY, r: 122, fill: 'none', stroke: '#94a3b8', 'stroke-width': '3', 'stroke-dasharray': '1.5 11.27', opacity: '0.45' }),
+		airflow,
+		rotor,
+		svgEl('g', {}, [
+			svgEl('circle', { cx: CX, cy: CY, r: 34, fill: 'url(#h5fan-hub-grad)', stroke: '#ffffff', 'stroke-width': '2' }),
+			svgEl('circle', { cx: CX, cy: CY, r: 24, fill: '#f8fafc', stroke: '#e2e8f0', 'stroke-width': '1.5' }),
+			svgEl('circle', { cx: CX, cy: CY, r: 9, fill: 'url(#h5fan-progress-grad)' }),
+			svgEl('circle', { cx: CX - 2.5, cy: CY - 2.5, r: 2.5, fill: '#ffffff', opacity: '0.8' })
+		]),
+		svgEl('g', {}, [
+			svgEl('rect', { x: 142, y: 322, width: 136, height: 40, rx: 20, fill: '#ffffff', stroke: '#f1f5f9', 'stroke-width': '1.5' }),
+			svgEl('circle', { cx: 164, cy: 342, r: 4.5, fill: '#0ea5e9', 'class': 'h5fan-dot' }),
+			svgEl('circle', { cx: 164, cy: 342, r: 8, fill: '#0ea5e9', opacity: '0.15' }),
+			capsuleLabel,
+			capsuleValue
+		])
 	]);
 
 	svg.h5update = function(status) {
@@ -380,25 +471,38 @@ function mountFanDiagram() {
 			classes.push('is-fast');
 
 		svg.setAttribute('class', classes.join(' '));
-		readout.textContent = percent === null ? '\u2014' : '%d%%'.format(percent);
+
+		if (percent === null) {
+			progress.setAttribute('stroke-dasharray', '0 %s'.format(RING_CIRC));
+			anchor.setAttribute('display', 'none');
+			capsuleValue.textContent = '\u2014';
+			rotor.setAttribute('style', '');
+		} else {
+			progress.setAttribute('stroke-dasharray', '%s %s'.format(
+				(RING_ARC * percent / 100).toFixed(2), RING_CIRC));
+			var angle = (135 + 2.7 * percent) * Math.PI / 180;
+			anchor.setAttribute('cx', (CX + RING_R * Math.cos(angle)).toFixed(2));
+			anchor.setAttribute('cy', (CY + RING_R * Math.sin(angle)).toFixed(2));
+			anchor.setAttribute('display', 'inline');
+			capsuleValue.textContent = '%d%%'.format(percent);
+			/* The rotor spins faster the harder the fan is driven. */
+			rotor.setAttribute('style', 'animation-duration:%s'.format(
+				(4.6 - 3.7 * percent / 100).toFixed(2) + 's'));
+		}
 
 		if (health === 'failsafe')
-			caption.textContent = _('Failsafe cooling');
+			capsuleLabel.textContent = _('Failsafe');
 		else if (health === 'error')
-			caption.textContent = _('Controller error');
+			capsuleLabel.textContent = _('Error');
 		else if (health === 'stopped')
-			caption.textContent = _('Controller not running');
-		else if (percent === null)
-			caption.textContent = _('No output reading');
+			capsuleLabel.textContent = _('Stopped');
 		else if (percent === 0)
-			caption.textContent = _('Stopped by policy');
-		else if (fan.kernel_floor_applied)
-			caption.textContent = _('Raised by the kernel floor');
+			capsuleLabel.textContent = _('Idle');
 		else
-			caption.textContent = _('Output %d%%').format(percent);
+			capsuleLabel.textContent = _('Output');
 
 		svg.setAttribute('aria-label', _('Fan output %1$s, %2$s').format(
-			percent === null ? _('unknown') : '%d%%'.format(percent), caption.textContent));
+			percent === null ? _('unknown') : '%d%%'.format(percent), capsuleLabel.textContent));
 	};
 
 	return svg;
@@ -489,8 +593,12 @@ function mountTempBar(slot) {
 }
 
 function mountCurveChart() {
-	var width = 660, height = 300, left = 46, right = 16, top = 20, bottom = 34;
-	var plotWidth = width - left - right, plotHeight = height - top - bottom;
+	/*
+	 * Geometry of the curve card design: the plot spans 20°..110 °C across
+	 * x=88..808 and 0..100% down y=130..390, everything else hangs off those
+	 * anchors.
+	 */
+	var left = 88, right = 808, top = 130, bottom = 390, plotWidth = right - left;
 	var minTemp = 20, maxTemp = 110;
 
 	function xFor(temp) {
@@ -498,60 +606,145 @@ function mountCurveChart() {
 	}
 
 	function yFor(percent) {
-		return top + (100 - clamp(percent, 0, 100)) * plotHeight / 100;
+		return bottom - clamp(percent, 0, 100) * (bottom - top) / 100;
 	}
 
 	var grid = svgEl('g', { 'class': 'h5fan-grid' });
 	var axis = svgEl('g', { 'class': 'h5fan-axis' });
 	var area = svgEl('path', { 'class': 'h5fan-area', fill: 'url(#h5fan-area-grad)' });
-	var line = svgEl('path', { 'class': 'h5fan-curve' });
-	var floorLine = svgEl('line', { 'class': 'h5fan-floor', x1: left, x2: left + plotWidth });
-	var targetLine = svgEl('line', { 'class': 'h5fan-target', x1: left, x2: left + plotWidth });
-	var cursor = svgEl('line', { 'class': 'h5fan-cursor', y1: top, y2: top + plotHeight });
-	var marker = svgEl('circle', { 'class': 'h5fan-marker', r: 6 });
-	var markerText = svgEl('text', { 'class': 'h5fan-marker-text', 'text-anchor': 'middle', y: top - 5 });
+	var line = svgEl('path', {
+		'class': 'h5fan-curve', fill: 'none',
+		stroke: 'url(#h5fan-curve-grad)', 'stroke-width': '3.6',
+		'stroke-linecap': 'round', 'stroke-linejoin': 'round', filter: 'url(#h5fan-glow)'
+	});
+	var floorLine = svgEl('line', {
+		'class': 'h5fan-floor', x1: left, x2: right,
+		stroke: '#ef4444', 'stroke-width': '2.2', 'stroke-dasharray': '8 6', opacity: '0.85'
+	});
+	var floorLabel = svgEl('text', {
+		x: 766, y: 278.5, 'class': 'h5fan-line-pill-text is-floor', 'text-anchor': 'middle'
+	}, [ '' ]);
+	var floorPill = svgEl('rect', {
+		x: 730, y: 266, width: 72, height: 18, rx: 4, 'class': 'h5fan-line-pill is-floor'
+	});
+	var targetLine = svgEl('line', {
+		'class': 'h5fan-target', x1: left, x2: right,
+		stroke: '#3b82f6', 'stroke-width': '2.2', 'stroke-dasharray': '4 5', opacity: '0.9'
+	});
+	var targetLabel = svgEl('text', {
+		x: 766, y: 235.5, 'class': 'h5fan-line-pill-text is-target', 'text-anchor': 'middle'
+	}, [ '' ]);
+	var targetPill = svgEl('rect', {
+		x: 730, y: 223, width: 72, height: 18, rx: 4, 'class': 'h5fan-line-pill is-target'
+	});
+	var cursor = svgEl('line', {
+		'class': 'h5fan-cursor', y1: top, y2: bottom,
+		stroke: 'url(#h5fan-beam-grad)', 'stroke-width': '2'
+	});
+	var markerPulse = svgEl('circle', { r: 10, 'class': 'h5fan-marker-pulse' });
+	var marker = svgEl('circle', { r: 8.5, 'class': 'h5fan-marker' });
+	var tooltipText = svgEl('text', {
+		x: 0, y: 18.5, 'class': 'h5fan-tooltip-text', 'text-anchor': 'middle'
+	}, [ '' ]);
+	var tooltip = svgEl('g', { 'class': 'h5fan-tooltip', display: 'none' }, [
+		svgEl('rect', { x: -52, y: 0, width: 104, height: 28, rx: 8, 'class': 'h5fan-tooltip-box' }),
+		svgEl('path', { d: 'M -5,28 L 0,34 L 5,28 Z', 'class': 'h5fan-tooltip-box' }),
+		tooltipText
+	]);
 	var nodes = svgEl('g', {});
 	var error = svgEl('text', {
-		x: width / 2, y: height / 2, 'class': 'h5fan-chart-error', 'text-anchor': 'middle'
+		x: (left + right) / 2, y: (top + bottom) / 2, 'class': 'h5fan-chart-error', 'text-anchor': 'middle'
 	}, [ '' ]);
 
 	[ 0, 25, 50, 75, 100 ].forEach(function(level) {
 		grid.appendChild(svgEl('line', {
-			x1: left, x2: left + plotWidth, y1: yFor(level), y2: yFor(level), 'class': 'h5fan-grid-line'
+			x1: left, x2: right, y1: yFor(level), y2: yFor(level),
+			'class': level % 50 ? 'h5fan-grid-line is-dashed' : 'h5fan-grid-line'
 		}));
 		axis.appendChild(svgEl('text', {
-			x: left - 8, y: yFor(level) + 4, 'class': 'h5fan-tick', 'text-anchor': 'end'
+			x: left - 14, y: yFor(level) + 4.5, 'class': 'h5fan-tick', 'text-anchor': 'end'
 		}, [ '%d%%'.format(level) ]));
 	});
 
 	[ 20, 35, 50, 65, 80, 95, 110 ].forEach(function(temp) {
 		grid.appendChild(svgEl('line', {
-			x1: xFor(temp), x2: xFor(temp), y1: top, y2: top + plotHeight, 'class': 'h5fan-grid-line'
+			x1: xFor(temp), x2: xFor(temp), y1: top, y2: bottom,
+			'class': temp === minTemp || temp === maxTemp ? 'h5fan-grid-line is-edge' : 'h5fan-grid-line is-faint'
 		}));
 		axis.appendChild(svgEl('text', {
-			x: xFor(temp), y: height - 14, 'class': 'h5fan-tick', 'text-anchor': 'middle'
+			x: xFor(temp), y: bottom + 24, 'class': 'h5fan-tick', 'text-anchor': 'middle'
 		}, [ '%d°'.format(temp) ]));
 	});
 
-	axis.appendChild(svgEl('line', { x1: left, x2: left, y1: top, y2: top + plotHeight, 'class': 'h5fan-axis-line' }));
 	axis.appendChild(svgEl('line', {
-		x1: left, x2: left + plotWidth, y1: top + plotHeight, y2: top + plotHeight, 'class': 'h5fan-axis-line'
+		x1: left, x2: left, y1: top, y2: bottom, 'class': 'h5fan-axis-line'
 	}));
-	axis.appendChild(svgEl('text', { x: left, y: height - 2, 'class': 'h5fan-axis-name' }, [ _('Temperature (°C)') ]));
+	axis.appendChild(svgEl('line', {
+		x1: left, x2: right, y1: bottom, y2: bottom, 'class': 'h5fan-axis-line is-baseline'
+	}));
+	axis.appendChild(svgEl('text', {
+		x: left, y: bottom + 48, 'class': 'h5fan-axis-name'
+	}, [ _('Temperature (°C)') ]));
+
+	var legend = svgEl('g', { 'class': 'h5fan-legend' }, [
+		svgEl('g', { transform: 'translate(44, 462)' }, [
+			svgEl('rect', { x: 0, y: 0, width: 166, height: 36, rx: 10, 'class': 'h5fan-legend-pill is-green' }),
+			svgEl('line', { x1: 14, y1: 18, x2: 32, y2: 18, stroke: '#10b981', 'stroke-width': '3', 'stroke-linecap': 'round' }),
+			svgEl('circle', { cx: 23, cy: 18, r: 3.5, fill: '#ffffff', stroke: '#10b981', 'stroke-width': '2' }),
+			svgEl('text', { x: 40, y: 23, 'class': 'h5fan-legend-text is-green' }, [ _('Solid green: the control function') ])
+		]),
+		svgEl('g', { transform: 'translate(224, 462)' }, [
+			svgEl('rect', { x: 0, y: 0, width: 192, height: 36, rx: 10, 'class': 'h5fan-legend-pill is-red' }),
+			svgEl('line', { x1: 14, y1: 18, x2: 34, y2: 18, stroke: '#ef4444', 'stroke-width': '2.5', 'stroke-dasharray': '5 3', 'stroke-linecap': 'round' }),
+			svgEl('text', { x: 42, y: 23, 'class': 'h5fan-legend-text is-red' }, [ _('Red dashed: kernel safety floor') ])
+		]),
+		svgEl('g', { transform: 'translate(430, 462)' }, [
+			svgEl('rect', { x: 0, y: 0, width: 166, height: 36, rx: 10, 'class': 'h5fan-legend-pill is-blue' }),
+			svgEl('line', { x1: 14, y1: 18, x2: 34, y2: 18, stroke: '#3b82f6', 'stroke-width': '2.5', 'stroke-dasharray': '3 3', 'stroke-linecap': 'round' }),
+			svgEl('text', { x: 42, y: 23, 'class': 'h5fan-legend-text is-blue' }, [ _('Blue dashed: target output') ])
+		]),
+		svgEl('g', { transform: 'translate(610, 462)' }, [
+			svgEl('rect', { x: 0, y: 0, width: 192, height: 36, rx: 10, 'class': 'h5fan-legend-pill is-marker' }),
+			svgEl('circle', { cx: 24, cy: 18, r: 5.5, fill: '#ffffff', stroke: '#3b82f6', 'stroke-width': '3' }),
+			svgEl('text', { x: 40, y: 23, 'class': 'h5fan-legend-text is-marker' }, [ _('Marker: current control temperature') ])
+		])
+	]);
 
 	var svg = svgEl('svg', {
-		viewBox: '0 0 %d %d'.format(width, height), 'class': 'h5fan-chart',
-		role: 'img', preserveAspectRatio: 'xMidYMid meet', 'aria-label': _('Fan curve')
+		viewBox: '0 0 880 540', 'class': 'h5fan-chart', role: 'img',
+		preserveAspectRatio: 'xMidYMid meet', 'aria-label': _('Fan curve')
 	}, [
 		svgEl('title', {}, [ _('Temperature to fan output curve') ]),
 		svgEl('desc', {}, [ _('Every point on the line is the output the controller applies at that temperature.') ]),
-		svgEl('defs', {}, [ svgEl('linearGradient', {
-			id: 'h5fan-area-grad', x1: '0', y1: '0', x2: '0', y2: '1'
-		}, [
-			svgEl('stop', { offset: '0%', 'stop-color': '#2ea97a', 'stop-opacity': '0.30' }),
-			svgEl('stop', { offset: '100%', 'stop-color': '#2ea97a', 'stop-opacity': '0.03' })
-		]) ]),
-		grid, axis, area, line, floorLine, targetLine, cursor, marker, markerText, nodes, error
+		svgEl('defs', {}, [
+			svgEl('linearGradient', { id: 'h5fan-curve-grad', x1: '0%', y1: '100%', x2: '100%', y2: '0%' }, [
+				svgEl('stop', { offset: '0%', 'stop-color': '#10b981' }),
+				svgEl('stop', { offset: '50%', 'stop-color': '#059669' }),
+				svgEl('stop', { offset: '100%', 'stop-color': '#0d9488' })
+			]),
+			svgEl('linearGradient', { id: 'h5fan-area-grad', x1: '0%', y1: '0%', x2: '0%', y2: '100%' }, [
+				svgEl('stop', { offset: '0%', 'stop-color': '#10b981', 'stop-opacity': '0.28' }),
+				svgEl('stop', { offset: '65%', 'stop-color': '#10b981', 'stop-opacity': '0.08' }),
+				svgEl('stop', { offset: '100%', 'stop-color': '#10b981', 'stop-opacity': '0.0' })
+			]),
+			svgEl('linearGradient', { id: 'h5fan-beam-grad', x1: '0%', y1: '0%', x2: '0%', y2: '100%' }, [
+				svgEl('stop', { offset: '0%', 'stop-color': '#3b82f6', 'stop-opacity': '0.9' }),
+				svgEl('stop', { offset: '50%', 'stop-color': '#3b82f6', 'stop-opacity': '0.5' }),
+				svgEl('stop', { offset: '100%', 'stop-color': '#3b82f6', 'stop-opacity': '0.15' })
+			]),
+			svgEl('filter', { id: 'h5fan-glow', x: '-5%', y: '-10%', width: '110%', height: '125%' }, [
+				svgEl('feDropShadow', { dx: '0', dy: '5', stdDeviation: '4', 'flood-color': '#059669', 'flood-opacity': '0.22' })
+			]),
+			svgEl('filter', { id: 'h5fan-node-shadow', x: '-30%', y: '-30%', width: '160%', height: '160%' }, [
+				svgEl('feDropShadow', { dx: '0', dy: '2', stdDeviation: '3', 'flood-color': '#0f172a', 'flood-opacity': '0.12' })
+			]),
+			svgEl('g', { id: 'h5fan-point' }, [
+				svgEl('circle', { cx: 0, cy: 0, r: 6, fill: '#ffffff', stroke: '#10b981', 'stroke-width': '3', filter: 'url(#h5fan-node-shadow)' })
+			])
+		]),
+		svgEl('rect', { x: left, y: top, width: plotWidth, height: bottom - top, 'class': 'h5fan-plot-bg' }),
+		grid, axis, area, floorLine, floorPill, floorLabel, targetLine, targetPill, targetLabel,
+		line, cursor, markerPulse, marker, tooltip, nodes, error, legend
 	]);
 
 	svg.h5update = function(data) {
@@ -566,10 +759,15 @@ function mountCurveChart() {
 		if (!usable) {
 			clear(nodes);
 			show(marker, false);
+			show(markerPulse, false);
 			show(cursor, false);
 			show(targetLine, false);
+			show(targetPill, false);
+			show(targetLabel, false);
 			show(floorLine, false);
-			markerText.textContent = '';
+			show(floorPill, false);
+			show(floorLabel, false);
+			show(tooltip, false);
 			svg.setAttribute('aria-label', _('Curve unavailable: %s').format(data.error || ''));
 			return;
 		}
@@ -581,53 +779,74 @@ function mountCurveChart() {
 
 		line.setAttribute('d', path);
 		area.setAttribute('d', '%s L%s %s L%s %s Z'.format(
-			path, xFor(maxTemp).toFixed(2), (top + plotHeight), xFor(minTemp).toFixed(2), (top + plotHeight)));
+			path, right.toFixed(2), bottom.toFixed(2), left.toFixed(2), bottom.toFixed(2)));
 
 		clear(nodes);
 
 		points.forEach(function(point) {
-			nodes.appendChild(svgEl('circle', {
-				cx: xFor(point.temp), cy: yFor(point.percent), r: 4.5, 'class': 'h5fan-node-dot'
-			}));
-			nodes.appendChild(svgEl('text', {
-				x: xFor(point.temp), y: yFor(point.percent) - 10,
-				'class': 'h5fan-node-text', 'text-anchor': 'middle'
-			}, [ '%d°:%d%%'.format(point.temp, point.percent) ]));
+			var label = '%d°:%d%%'.format(point.temp, point.percent);
+			nodes.appendChild(svgEl('g', { transform: 'translate(%s, %s)'.format(
+				xFor(point.temp).toFixed(2), yFor(point.percent).toFixed(2)) }, [
+				svgEl('use', { href: '#h5fan-point' }),
+				svgEl('rect', { x: -32, y: -32, width: 64, height: 20, rx: 5, 'class': 'h5fan-node-pill' }),
+				svgEl('text', { x: 0, y: -18, 'class': 'h5fan-node-text', 'text-anchor': 'middle' }, [ label ])
+			]));
 		});
 
 		if (known(data.targetPercent)) {
 			targetLine.setAttribute('y1', yFor(data.targetPercent));
 			targetLine.setAttribute('y2', yFor(data.targetPercent));
+			targetPill.setAttribute('y', (yFor(data.targetPercent) - 24).toFixed(2));
+			targetLabel.setAttribute('y', (yFor(data.targetPercent) - 11.5).toFixed(2));
+			targetLabel.textContent = _('Target %d%%').format(data.targetPercent);
 			show(targetLine, true);
+			show(targetPill, true);
+			show(targetLabel, true);
 		} else {
 			show(targetLine, false);
+			show(targetPill, false);
+			show(targetLabel, false);
 		}
 
 		if (known(data.floorPercent) && data.floorPercent > 0) {
 			floorLine.setAttribute('y1', yFor(data.floorPercent));
 			floorLine.setAttribute('y2', yFor(data.floorPercent));
+			floorPill.setAttribute('y', (yFor(data.floorPercent) + 6).toFixed(2));
+			floorLabel.setAttribute('y', (yFor(data.floorPercent) + 18.5).toFixed(2));
+			floorLabel.textContent = _('Floor %d%%').format(data.floorPercent);
 			show(floorLine, true);
+			show(floorPill, true);
+			show(floorLabel, true);
 		} else {
 			show(floorLine, false);
+			show(floorPill, false);
+			show(floorLabel, false);
 		}
 
 		if (data.control && known(data.control.temp_c)) {
 			var at = curvePercentAt(points, data.control.temp_c);
-			cursor.setAttribute('x1', xFor(data.control.temp_c));
-			cursor.setAttribute('x2', xFor(data.control.temp_c));
+			var cursorX = xFor(data.control.temp_c);
+			cursor.setAttribute('x1', cursorX);
+			cursor.setAttribute('x2', cursorX);
 			show(cursor, true);
-			marker.setAttribute('cx', xFor(data.control.temp_c));
+			marker.setAttribute('cx', cursorX);
 			marker.setAttribute('cy', yFor(at));
+			markerPulse.setAttribute('cx', cursorX);
+			markerPulse.setAttribute('cy', yFor(at));
 			show(marker, true);
-			markerText.setAttribute('x', clamp(xFor(data.control.temp_c), left + 46, width - right - 46));
-			markerText.textContent = '%d °C · %d%%'.format(data.control.temp_c, at);
+			show(markerPulse, true);
+			tooltip.setAttribute('transform', 'translate(%s, %s)'.format(
+				clamp(cursorX, left + 56, right - 56).toFixed(2), (top - 38).toFixed(2)));
+			tooltipText.textContent = '%d °C · %d%%'.format(data.control.temp_c, at);
+			show(tooltip, true);
 			svg.setAttribute('aria-label', _('%1$s at %2$s gives %3$d%% output').format(
 				data.control.sensor_label || _('control temperature'),
 				formatTemp(data.control.temp_c), at));
 		} else {
 			show(cursor, false);
 			show(marker, false);
-			markerText.textContent = '';
+			show(markerPulse, false);
+			show(tooltip, false);
 			svg.setAttribute('aria-label', _('Fan curve'));
 		}
 	};
@@ -853,7 +1072,7 @@ return view.extend({
 			'.h5fan-kv-value.is-warn{color:var(--h5fan-amber)}.h5fan-kv-value.is-fail{color:var(--h5fan-red)}',
 			'.h5fan-kv-hint{font-size:11px;color:var(--text-color-low,#888);word-break:break-word}',
 			'.h5fan-badges{display:flex;flex-wrap:wrap;gap:7px}',
-			'.h5fan-badge{padding:4px 9px;border-radius:8px;font-size:11.5px;background:rgba(63,138,214,.12);color:var(--h5fan-blue)}',
+			'.h5fan-badge{padding:4px 9px;border-radius:8px;font-size:11.5px;background:rgba(63,138,214,.12);color:var(--h5fan-blue);white-space:nowrap}',
 			'.h5fan-badge.is-warn{background:rgba(217,150,63,.15);color:var(--h5fan-amber)}',
 			'.h5fan-badge.is-fail{background:rgba(214,91,91,.15);color:var(--h5fan-red)}',
 			'.h5fan-tag{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;background:rgba(127,127,127,.13)}',
@@ -870,28 +1089,27 @@ return view.extend({
 			'.h5fan-note.is-warn{background:rgba(217,150,63,.1);border-left-color:var(--h5fan-amber)}',
 			'.h5fan-note.is-fail{background:rgba(214,91,91,.1);border-left-color:var(--h5fan-red)}',
 			'.h5fan-tablewrap{overflow-x:auto}',
+			'.h5fan-events-wrap{max-height:320px;overflow-y:auto}',
 			'.h5fan-table{width:100%;border-collapse:collapse;font-size:12.5px}',
 			'.h5fan-table th,.h5fan-table td{padding:7px 8px;text-align:left;border-bottom:1px solid rgba(127,127,127,.15);vertical-align:top;word-break:break-word}',
 			'.h5fan-table th{font-weight:650;color:var(--text-color-medium,#666);white-space:nowrap}',
 			'.h5fan-table tr:last-child td{border-bottom:0}',
-			'.h5fan-fan{display:block;width:100%;max-width:212px;height:auto;margin:0 auto}',
-			'.h5fan-housing{fill:none;stroke:var(--h5fan-line);stroke-width:3}',
-			'.h5fan-shroud{fill:rgba(127,127,127,.06);stroke:none}',
-			'.h5fan-blade{fill:rgba(63,138,214,.45);stroke:rgba(63,138,214,.85);stroke-width:1.2}',
-			'.h5fan-hub{fill:var(--background-color-high,#fff);stroke:var(--h5fan-line);stroke-width:2}',
-			'.h5fan-fan-num{font-size:26px;font-weight:700;fill:var(--text-color-high,#222)}',
-			'.h5fan-fan-caption{font-size:12px;fill:var(--text-color-medium,#666)}',
-			'.h5fan-rotor{transform-origin:100px 100px}',
-			'.h5fan-fan.is-slow .h5fan-rotor{animation:h5fan-spin 5s linear infinite}',
-			'.h5fan-fan.is-medium .h5fan-rotor{animation:h5fan-spin 2.6s linear infinite}',
-			'.h5fan-fan.is-fast .h5fan-rotor{animation:h5fan-spin 1.4s linear infinite}',
-			'.h5fan-fan.is-stopped .h5fan-blade,.h5fan-fan.is-stopped .h5fan-hub{fill:rgba(127,127,127,.16);stroke:rgba(127,127,127,.45)}',
-			'.h5fan-fan.is-unknown .h5fan-blade{fill:rgba(127,127,127,.08);stroke:rgba(127,127,127,.3);stroke-dasharray:4 4}',
-			'.h5fan-fan.is-fault .h5fan-blade{fill:rgba(214,91,91,.3);stroke:var(--h5fan-red)}',
+			'.h5fan-fan{display:block;width:100%;max-width:250px;height:auto;margin:0 auto}',
+			'.h5fan-fan-panel{justify-content:center}',
+			'.h5fan-rotor{transform-origin:210px 195px;animation:h5fan-spin 2.8s linear infinite}',
+			'.h5fan-airflow{transform-origin:210px 195px;animation:h5fan-spin-rev 6s linear infinite}',
+			'.h5fan-dot{animation:h5fan-pulse 2s ease-in-out infinite}',
+			'.h5fan-progress-value{stroke:url(#h5fan-progress-grad)}',
+			'.h5fan-fan.is-fault .h5fan-progress-value{stroke:var(--h5fan-red)}',
+			'.h5fan-fan.is-stopped .h5fan-rotor,.h5fan-fan.is-unknown .h5fan-rotor{animation-play-state:paused;opacity:.55;filter:grayscale(.85)}',
 			'.h5fan-fan.is-fault .h5fan-rotor{animation:h5fan-wobble 1.1s ease-in-out infinite}',
+			'.h5fan-capsule-label{font-size:15px;fill:var(--text-color-medium,#64748b)}',
+			'.h5fan-capsule-value{font-size:17px;font-weight:700;fill:var(--text-color-high,#0f172a)}',
 			'@keyframes h5fan-spin{to{transform:rotate(360deg)}}',
+			'@keyframes h5fan-spin-rev{to{transform:rotate(-360deg)}}',
+			'@keyframes h5fan-pulse{0%,100%{opacity:1}50%{opacity:.45}}',
 			'@keyframes h5fan-wobble{0%,100%{transform:rotate(-7deg)}50%{transform:rotate(7deg)}}',
-			'@media (prefers-reduced-motion:reduce){.h5fan .h5fan-rotor{animation:none!important}}',
+			'@media (prefers-reduced-motion:reduce){.h5fan .h5fan-rotor,.h5fan .h5fan-airflow,.h5fan .h5fan-dot{animation:none!important}}',
 			'.h5fan-gauge{display:block;width:100%;max-width:132px;height:auto;margin:0 auto}',
 			'.h5fan-gauge-track{fill:none;stroke:rgba(127,127,127,.15);stroke-width:11}',
 			'.h5fan-gauge-value{fill:none;stroke:var(--h5fan-blue);stroke-width:11;stroke-linecap:round}',
@@ -899,18 +1117,35 @@ return view.extend({
 			'.h5fan-gauge-num{font-size:24px;font-weight:700;fill:var(--text-color-high,#222)}',
 			'.h5fan-gauge-unit{font-size:10px;fill:var(--text-color-medium,#666)}',
 			'.h5fan-chart{display:block;width:100%;height:auto}',
-			'.h5fan-grid-line{stroke:rgba(127,127,127,.13);stroke-width:1}',
-			'.h5fan-axis-line{stroke:rgba(127,127,127,.4);stroke-width:1.5}',
-			'.h5fan-tick{font-size:11px;fill:var(--text-color-medium,#666)}',
-			'.h5fan-axis-name{font-size:11px;fill:var(--text-color-low,#888)}',
-			'.h5fan-curve{fill:none;stroke:var(--h5fan-green);stroke-width:3;stroke-linejoin:round;stroke-linecap:round}',
-			'.h5fan-node-dot{fill:var(--background-color-high,#fff);stroke:var(--h5fan-green);stroke-width:2.5}',
-			'.h5fan-node-text{font-size:10.5px;fill:var(--text-color-medium,#666)}',
-			'.h5fan-floor{stroke:var(--h5fan-red);stroke-width:2;stroke-dasharray:7 5}',
-			'.h5fan-target{stroke:var(--h5fan-blue);stroke-width:2;stroke-dasharray:3 4}',
-			'.h5fan-cursor{stroke:rgba(63,138,214,.55);stroke-width:1.5}',
-			'.h5fan-marker{fill:#fff;stroke:var(--h5fan-blue);stroke-width:3}',
-			'.h5fan-marker-text{font-size:12px;font-weight:650;fill:var(--text-color-high,#222)}',
+			'.h5fan-plot-bg{fill:#f8fafc;opacity:.6}',
+			'.h5fan-grid-line{stroke:#e2e8f0;stroke-width:1}',
+			'.h5fan-grid-line.is-dashed{stroke-dasharray:4 4}',
+			'.h5fan-grid-line.is-faint{stroke:#f1f5f9}',
+			'.h5fan-grid-line.is-edge{stroke:#cbd5e1;stroke-width:1.5}',
+			'.h5fan-axis-line{stroke:#cbd5e1;stroke-width:1.5}',
+			'.h5fan-tick{font-size:12.5px;font-weight:500;fill:#64748b}',
+			'.h5fan-axis-name{font-size:13px;fill:#64748b}',
+			'.h5fan-line-pill.is-floor{fill:#fef2f2;opacity:.9}',
+			'.h5fan-line-pill.is-target{fill:#eff6ff;opacity:.9}',
+			'.h5fan-line-pill-text{font-size:10.5px;font-weight:600}',
+			'.h5fan-line-pill-text.is-floor{fill:#dc2626}',
+			'.h5fan-line-pill-text.is-target{fill:#2563eb}',
+			'.h5fan-node-pill{fill:#ffffff;stroke:#e2e8f0;stroke-width:1}',
+			'.h5fan-node-text{font-size:12px;font-weight:600;fill:#334155}',
+			'.h5fan-tooltip-box{fill:#0f172a}',
+			'.h5fan-tooltip-text{font-size:13px;font-weight:700;fill:#ffffff}',
+			'.h5fan-marker{fill:#ffffff;stroke:#3b82f6;stroke-width:4}',
+			'.h5fan-marker-pulse{fill:#3b82f6;opacity:.75;transform-box:fill-box;transform-origin:center;animation:h5fan-radar 2.2s cubic-bezier(.16,1,.3,1) infinite}',
+			'@keyframes h5fan-radar{0%{transform:scale(.8);opacity:.75}100%{transform:scale(2.5);opacity:0}}',
+			'.h5fan-legend-pill.is-green{fill:#ecfdf5;stroke:#a7f3d0}',
+			'.h5fan-legend-pill.is-red{fill:#fef2f2;stroke:#fecaca}',
+			'.h5fan-legend-pill.is-blue{fill:#eff6ff;stroke:#bfdbfe}',
+			'.h5fan-legend-pill.is-marker{fill:#f0f9ff;stroke:#bae6fd}',
+			'.h5fan-legend-text{font-size:13px;font-weight:600}',
+			'.h5fan-legend-text.is-green{fill:#065f46}',
+			'.h5fan-legend-text.is-red{fill:#b91c1c}',
+			'.h5fan-legend-text.is-blue{fill:#1d4ed8}',
+			'.h5fan-legend-text.is-marker{fill:#0369a1}',
 			'.h5fan-chart-error{font-size:13px;fill:var(--h5fan-red)}',
 			'.h5fan-bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}',
 			'.h5fan-node{padding:10px 12px}',
@@ -1307,15 +1542,12 @@ return view.extend({
 		this.overviewBadges = E('div', { 'class': 'h5fan-badges' });
 		this.overviewRows = E('div', { 'class': 'h5fan-rows' });
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span4' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span3 h5fan-fan-panel' }, [
 			E('h3', {}, [ _('Fan') ]),
-			this.charts.fan,
-			E('p', { 'class': 'h5fan-panel-sub' }, [
-				_('Schematic only. The animation follows the applied output, it is not a measured speed.')
-			])
+			this.charts.fan
 		]));
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
 			E('h3', {}, [ _('Outputs') ]),
 			E('div', { 'class': 'h5fan-bars' }, [
 				E('div', { 'class': 'h5fan-node' }, [ this.charts.output ]),
@@ -1400,13 +1632,6 @@ return view.extend({
 	buildCurve: function() {
 		var pane = this.panes.curve;
 
-		this.curveLegend = E('div', { 'class': 'h5fan-badges' }, [
-			E('span', { 'class': 'h5fan-badge' }, [ _('Solid green: the control function') ]),
-			E('span', { 'class': 'h5fan-badge is-fail' }, [ _('Red dashed: kernel safety floor') ]),
-			E('span', { 'class': 'h5fan-badge' }, [ _('Blue dashed: target output') ]),
-			E('span', { 'class': 'h5fan-badge' }, [ _('Marker: current control temperature') ])
-		]);
-
 		this.nodeList = E('div', { 'class': 'h5fan-nodes' });
 		this.nodeError = E('div', { 'class': 'h5fan-error' }, [ '' ]);
 
@@ -1415,8 +1640,7 @@ return view.extend({
 			E('p', { 'class': 'h5fan-panel-sub' }, [
 				_('The line is sampled once per degree with the same integer arithmetic the controller uses.')
 			]),
-			this.charts.curve,
-			this.curveLegend
+			this.charts.curve
 		]));
 
 		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
@@ -1516,11 +1740,11 @@ return view.extend({
 			])
 		]);
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
 			E('h3', {}, [ _('Controller') ]), this.diagRows
 		]));
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span7' }, [
 			E('h3', {}, [ _('Kernel protection') ]),
 			E('p', { 'class': 'h5fan-panel-sub' }, [
 				_('Read-only view of the thermal zone, its governor and the trip points the firmware declares.')
@@ -1528,7 +1752,7 @@ return view.extend({
 			this.protectRows
 		]));
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span5' }, [
 			E('h3', {}, [ _('Configuration check') ]),
 			E('p', { 'class': 'h5fan-panel-sub' }, [
 				_('Corrections the controller applied while reading the configuration file.')
@@ -1536,9 +1760,9 @@ return view.extend({
 			this.issueBox
 		]));
 
-		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span6' }, [
+		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span7' }, [
 			E('h3', {}, [ _('Recent events') ]),
-			E('div', { 'class': 'h5fan-tablewrap' }, [ this.eventTable ])
+			E('div', { 'class': 'h5fan-tablewrap h5fan-events-wrap' }, [ this.eventTable ])
 		]));
 	},
 
@@ -1816,7 +2040,7 @@ return view.extend({
 
 		if (protections.warnings && protections.warnings.length) {
 			protections.warnings.forEach(L.bind(function(warning) {
-				this.diagRows.appendChild(E('p', { 'class': 'h5fan-note is-warn' }, [ warning ]));
+				this.protectRows.appendChild(E('p', { 'class': 'h5fan-note is-warn' }, [ warning ]));
 			}, this));
 		}
 
