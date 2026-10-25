@@ -1,0 +1,59 @@
+#!/bin/sh
+# One-time migration for luci-app-h5000m-fancontrol 3.x.
+#
+# The UCI option set is unchanged from 2.x, so an upgraded router keeps its
+# configured curves, mode and safety parameters. This script only:
+#   - stamps the new schema version,
+#   - repairs configs missing options added during the 2.x series,
+#   - migrates the historical `off` mode name,
+#   - cleans options removed in 1.x,
+# and is safe to run any number of times.
+
+schema="$(uci -q get h5000m_fancontrol.settings.schema_version || echo 0)"
+case "$schema" in ''|*[!0-9]*) schema=0 ;; esac
+
+if [ "$schema" -lt 3 ]; then
+	[ "$(uci -q get h5000m_fancontrol.settings.mode || true)" = "off" ] && \
+		uci -q set h5000m_fancontrol.settings.mode='kernel'
+
+	# Options introduced across 2.x; only set when absent so user values win.
+	[ -n "$(uci -q get h5000m_fancontrol.settings.temp_source)" ] || \
+		uci -q set h5000m_fancontrol.settings.temp_source='max'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.interval)" ] || \
+		uci -q set h5000m_fancontrol.settings.interval='5'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.hysteresis)" ] || \
+		uci -q set h5000m_fancontrol.settings.hysteresis='2'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.down_delay)" ] || \
+		uci -q set h5000m_fancontrol.settings.down_delay='30'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.start_pwm)" ] || \
+		uci -q set h5000m_fancontrol.settings.start_pwm='192'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.start_boost_ms)" ] || \
+		uci -q set h5000m_fancontrol.settings.start_boost_ms='700'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.fail_pwm)" ] || \
+		uci -q set h5000m_fancontrol.settings.fail_pwm='255'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.curve_silent)" ] || \
+		uci -q set h5000m_fancontrol.settings.curve_silent='20:0,35:0,40:50,55:50,70:60,85:75,95:100'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.curve_balanced)" ] || \
+		uci -q set h5000m_fancontrol.settings.curve_balanced='20:0,35:0,40:50,55:60,70:75,85:90,95:100'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.curve_performance)" ] || \
+		uci -q set h5000m_fancontrol.settings.curve_performance='20:0,30:60,45:70,60:82,75:92,85:100'
+	[ -n "$(uci -q get h5000m_fancontrol.settings.curve_custom)" ] || \
+		uci -q set h5000m_fancontrol.settings.curve_custom='20:0,40:50,55:60,70:75,85:90,95:100'
+
+	# Removed in 2.x; drop leftovers so they never reach the controller.
+	uci -q delete h5000m_fancontrol.settings.min_pwm 2>/dev/null
+	uci -q delete h5000m_fancontrol.settings.max_pwm 2>/dev/null
+	uci -q delete h5000m_fancontrol.settings.low_temp 2>/dev/null
+	uci -q delete h5000m_fancontrol.settings.high_temp 2>/dev/null
+
+	uci -q set h5000m_fancontrol.settings.schema_version='3'
+	uci -q commit h5000m_fancontrol
+fi
+
+# Upgrade from releases whose controller was a shell script: the procd
+# instance command is unchanged (/usr/sbin/h5000m-fancontrol daemon), so a
+# plain restart swaps in the Rust binary.
+/etc/init.d/h5000m-fancontrol enable >/dev/null 2>&1 || true
+/etc/init.d/h5000m-fancontrol restart >/dev/null 2>&1 || true
+
+exit 0

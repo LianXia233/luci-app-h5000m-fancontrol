@@ -3,6 +3,9 @@
 START=98
 USE_PROCD=1
 
+# procd runs the Rust controller in the foreground and respawns it. The
+# daemon keeps the fan at its last output during restarts and releases its
+# lock and legacy thermal policy file on SIGTERM.
 start_service() {
 	procd_open_instance
 	procd_set_param command /usr/sbin/h5000m-fancontrol daemon
@@ -13,8 +16,10 @@ start_service() {
 }
 
 reload_service() {
-	stop
-	start
+	# SIGHUP makes the daemon reload its configuration and run one control
+	# cycle immediately. If the service is not running, stay quiet - a
+	# configuration commit must not silently re-enable it.
+	procd_send_signal h5000m-fancontrol '' SIGHUP 2>/dev/null || true
 }
 
 service_triggers() {

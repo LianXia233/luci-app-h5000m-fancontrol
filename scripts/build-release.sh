@@ -22,6 +22,13 @@ cd "${sdk_dir}"
 ./scripts/feeds update -a
 ./scripts/feeds install luci-base
 
+# The Rust controller cross-compiles inside the SDK package build. Make sure
+# the toolchain and the musl target for the router architecture are present;
+# the crate itself has no dependencies and builds offline from Cargo.lock.
+rustup target add aarch64-unknown-linux-musl
+cargo --version
+rustc --version
+
 perl -0pi -e 's/(config ALL\n\s+bool "Select all userspace packages by default"\n\s+default )y/${1}n/' Config.in
 perl -0pi -e 's/(config TARGET_MULTI_PROFILE\n\s+bool\n\s+default )y/${1}n/; s/(config TARGET_ALL_PROFILES\n\s+bool\n\s+default )y/${1}n/; s/(config TARGET_DEVICE_mediatek_filogic_DEVICE_[^\n]+\n\s+bool\n\s+default )y/${1}n/g' Config-build.in
 sed -i 's/^[[:space:]]*default m$/\tdefault n/' Config-build.in
@@ -42,6 +49,21 @@ make package/h5000m-custom/luci-app-h5000m-fancontrol/compile -j"$(nproc)" V=s
 
 find bin -type f \( -name 'luci-app-h5000m-fancontrol-*.apk' -o -name 'luci-app-h5000m-fancontrol_*.ipk' -o -name 'luci-i18n-h5000m-fancontrol-zh-cn-*.apk' -o -name 'luci-i18n-h5000m-fancontrol-zh-cn_*.ipk' \) -exec cp -f {} "${output_dir}/" \;
 test "$(find "${output_dir}" -type f \( -name '*.apk' -o -name '*.ipk' \) | wc -l)" -ge 2
+
+# Prove the packaged controller is an aarch64 static binary, not a host build.
+app_apk="$(find "${output_dir}" -type f -name 'luci-app-h5000m-fancontrol-*.apk' | head -n 1)"
+if [ -n "${app_apk}" ]; then
+  binary_info="$(tar -xzOf "${app_apk}" data.tar.gz | tar -tzf - | grep -m1 'usr/sbin/h5000m-fancontrol$' || true)"
+  test -n "${binary_info}" || { echo 'controller binary missing from apk' >&2; exit 1; }
+  tar -xzOf "${app_apk}" data.tar.gz | tar -xzf - -O ./usr/sbin/h5000m-fancontrol > /tmp/h5000m-fancontrol.check
+  file /tmp/h5000m-fancontrol.check | grep -Eq 'ELF 64-bit.*aarch64.*statically linked' || {
+    echo 'packaged controller is not a statically linked aarch64 ELF' >&2
+    file /tmp/h5000m-fancontrol.check >&2
+    exit 1
+  }
+  rm -f /tmp/h5000m-fancontrol.check
+fi
+
 if find "${output_dir}" -name '*.apk' | grep -q .; then
   cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
   mkdir -p "${work_dir}/verification-keys"
