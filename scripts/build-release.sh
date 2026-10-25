@@ -53,9 +53,12 @@ test "$(find "${output_dir}" -type f \( -name '*.apk' -o -name '*.ipk' \) | wc -
 # Prove the packaged controller is an aarch64 static binary, not a host build.
 app_apk="$(find "${output_dir}" -type f -name 'luci-app-h5000m-fancontrol-*.apk' | head -n 1)"
 if [ -n "${app_apk}" ]; then
-  binary_info="$(tar -xzOf "${app_apk}" data.tar.gz | tar -tzf - | grep -m1 'usr/sbin/h5000m-fancontrol$' || true)"
+  # An APKv2 file is three concatenated gzipped tar streams (signature,
+  # control, data); without --ignore-zeros tar stops at the first
+  # end-of-archive marker and only ever sees the signature segment.
+  binary_info="$(tar -tzif "${app_apk}" | grep -m1 'usr/sbin/h5000m-fancontrol$' || true)"
   test -n "${binary_info}" || { echo 'controller binary missing from apk' >&2; exit 1; }
-  tar -xzOf "${app_apk}" data.tar.gz | tar -xzf - -O ./usr/sbin/h5000m-fancontrol > /tmp/h5000m-fancontrol.check
+  tar -xzif "${app_apk}" -O "${binary_info}" > /tmp/h5000m-fancontrol.check
   file /tmp/h5000m-fancontrol.check | grep -Eq 'ELF 64-bit.*aarch64.*statically linked' || {
     echo 'packaged controller is not a statically linked aarch64 ELF' >&2
     file /tmp/h5000m-fancontrol.check >&2
