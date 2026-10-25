@@ -102,9 +102,8 @@ mod tests {
         #[cfg(unix)]
         let (program, args) = ("/bin/sh", vec!["-c", "echo hello"]);
         #[cfg(windows)]
-        let (program, args) = ("cmd", vec!["/C".to_string(), "echo hello".to_string()]);
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let out = run_with_timeout(program, &arg_refs, Duration::from_secs(5));
+        let (program, args) = ("cmd", vec!["/C", "echo hello"]);
+        let out = run_with_timeout(program, &args, Duration::from_secs(5));
         assert!(out.is_some());
         assert!(out.unwrap().contains("hello"));
     }
@@ -114,13 +113,9 @@ mod tests {
         #[cfg(unix)]
         let (program, args) = ("/bin/sh", vec!["-c", "sleep 5"]);
         #[cfg(windows)]
-        let (program, args) = (
-            "cmd",
-            vec!["/C".to_string(), "ping -n 5 127.0.0.1 > NUL".to_string()],
-        );
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let (program, args) = ("cmd", vec!["/C", "ping -n 5 127.0.0.1 > NUL"]);
         let start = Instant::now();
-        let out = run_with_timeout(program, &arg_refs, Duration::from_millis(300));
+        let out = run_with_timeout(program, &args, Duration::from_millis(300));
         assert!(out.is_none());
         assert!(start.elapsed() < Duration::from_secs(3));
     }
