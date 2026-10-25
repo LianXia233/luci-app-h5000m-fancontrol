@@ -1,140 +1,131 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8\n"
 
-msgid "Fan Control"
-msgstr "风扇控制"
+msgid "%d / 255 (%d%%)"
+msgstr "%d / 255（%d%%）"
 
-msgid "Adjust the PWM fan policy."
-msgstr "调节 PWM 风扇策略。"
+msgid "%d degrees Celsius, %s"
+msgstr "%d 摄氏度，%s"
 
-msgid "Current Status"
-msgstr "当前状态"
+msgid "%d s"
+msgstr "%d 秒"
 
-msgid "Fan Speed"
-msgstr "风扇速度"
+msgid "%d°C"
+msgstr "%d°C"
 
-msgid "Current PWM"
-msgstr "当前 PWM"
-
-msgid "Modem Temperature"
-msgstr "模块温度"
-
-msgid "CPU Temperature"
-msgstr "CPU 温度"
-
-msgid "WiFi Temperature 1"
-msgstr "WiFi 温度 1"
-
-msgid "WiFi Temperature 2"
-msgstr "WiFi 温度 2"
-
-msgid "Unknown"
-msgstr "未知"
-
-msgid "PWM percentage unavailable"
-msgstr "PWM 百分比不可用"
-
-msgid "PWM node not found"
-msgstr "未找到 PWM 节点"
-
-msgid "From QModem cache"
-msgstr "来自 QModem 缓存"
-
-msgid "Fan Curve"
-msgstr "风扇曲线"
-
-msgid "Auto Curve"
-msgstr "自动曲线"
-
-msgid "Manual PWM"
-msgstr "手动 PWM"
-
-msgid "Temperature"
-msgstr "温度"
-
-msgid "Temperature Range"
-msgstr "温度区间"
-
-msgid "PWM Range"
-msgstr "PWM 区间"
-
-msgid "Manual mode: the slider value is used as a fixed PWM output."
-msgstr "手动模式：滑杆数值作为固定 PWM 输出。"
-
-msgid "Off mode: fan PWM output is set to 0."
-msgstr "关闭模式：风扇 PWM 输出为 0。"
-
-msgid "Auto mode: low temperatures use the minimum PWM, high temperatures use the maximum PWM, and values in between increase linearly."
-msgstr "自动模式：低温使用最低 PWM，高温使用最高 PWM，中间线性递增。"
-
-msgid "Enable"
-msgstr "启用"
-
-msgid "Mode"
-msgstr "模式"
-
-msgid "Auto"
-msgstr "自动"
-
-msgid "Manual"
-msgstr "手动"
-
-msgid "Off"
-msgstr "关闭"
-
-msgid "Minimum PWM"
-msgstr "最低 PWM"
-
-msgid "Maximum PWM"
-msgstr "最高 PWM"
-
-msgid "Low Temperature Threshold"
-msgstr "低温阈值"
-
-msgid "High Temperature Threshold"
-msgstr "高温阈值"
-
-msgid "Refresh Interval"
-msgstr "刷新间隔"
-
-msgid "Fan control has been applied."
-msgstr "风扇控制已应用。"
-
-msgid "Failed to apply fan control:"
-msgstr "风扇控制应用失败："
-
-msgid "%s / 255 · %s%%"
-msgstr "%s / 255 · %s%%"
-
-msgid "%s °C"
-msgstr "%s °C"
+msgid "%s · kernel safety floor"
+msgstr "%s · 内核安全下限"
 
 msgid "5G modem"
-msgstr "5G 模块"
+msgstr "5G 模组"
 
 msgid "A short boost helps a stopped fan start reliably. Set 0 to disable."
-msgstr "短时助推可帮助停止的风扇可靠启动；设为 0 可关闭助推。"
+msgstr "短时助推可帮助停转的风扇可靠启动；设为 0 可关闭助推。"
 
-msgid "Applied output"
+msgid "Actual output"
 msgstr "实际输出"
 
-msgid "Control ownership"
-msgstr "控制权"
+msgid "Add node"
+msgstr "添加节点"
 
-msgid "Fan manager"
-msgstr "风扇管理器"
+msgid "All configured values are valid."
+msgstr "所有配置值均有效。"
 
-msgid "Exclusive fan policy control"
-msgstr "独占风扇策略控制"
+msgid "Allowed range: %d–%d"
+msgstr "允许范围：%d–%d"
 
-msgid "The fan manager has exclusive fan policy control. Kernel CPU throttling and hot/critical over-temperature protection remain active."
-msgstr "风扇管理器独占风扇策略控制；内核 CPU 降频及高温/临界过热保护仍保持启用。"
+msgid "Applied in manual mode. The kernel safety floor may raise the effective output above this value."
+msgstr "仅在手动模式下生效。内核安全下限可能使实际输出高于此设置值。"
+
+msgid "At most 16 nodes are supported."
+msgstr "最多支持 16 个节点。"
+
+msgid "Attention"
+msgstr "需要关注"
 
 msgid "Automatic"
 msgstr "自动"
 
+msgid "Automatic curve"
+msgstr "自动曲线"
+
+msgid "Automatic follows the fan curve; Manual drives a fixed PWM; Kernel protection only leaves the fan to the kernel governor."
+msgstr "自动模式跟随风扇曲线；手动模式输出固定 PWM；仅内核保护模式将风扇完全交给内核调速器。"
+
 msgid "Balanced"
 msgstr "均衡"
+
+msgid "Cancel"
+msgstr "取消"
+
+msgid "Cannot read controller status. Check that the h5000m-fancontrol service is installed and running."
+msgstr "无法读取控制器状态。请检查 h5000m-fancontrol 服务是否已安装并正在运行。"
+
+msgid "Cannot save the configuration:"
+msgstr "无法保存配置："
+
+msgid "Changes apply after Save"
+msgstr "保存后生效"
+
+msgid "Checking…"
+msgstr "正在检查…"
+
+msgid "Colour bands are plugin reference values. The CPU bands mirror the controller’s kernel cooling-map floors (83/113°C); other sensors use conservative engineering estimates, not official vendor limits. A missing reading is shown as unknown, never as 0°C."
+msgstr "颜色分级为本插件参考值。CPU 分级与控制器的内核 cooling-map 阈值（83/113°C）一致；其他传感器采用保守的工程估计值，并非厂商官方上限。缺失的读数显示为未知，绝不会显示为 0°C。"
+
+msgid "Configuration check"
+msgstr "配置检查"
+
+msgid "Configuration unchanged; control cycle executed."
+msgstr "配置未变化；已执行一次控制循环。"
+
+msgid "Continue"
+msgstr "继续"
+
+msgid "Control cycle executed."
+msgstr "控制循环已执行。"
+
+msgid "Control cycle failed:"
+msgstr "控制循环执行失败："
+
+msgid "Control input: %s (%s)"
+msgstr "控制依据：%s（%s）"
+
+msgid "Control interval"
+msgstr "控制间隔"
+
+msgid "Control reason"
+msgstr "控制原因"
+
+msgid "Control temperature"
+msgstr "控制温度"
+
+msgid "Controller"
+msgstr "控制器"
+
+msgid "Controller disabled"
+msgstr "控制器已停用"
+
+msgid "Controller error"
+msgstr "控制器错误"
+
+msgid "controller returned an error"
+msgstr "控制器返回错误"
+
+msgid "Controller version"
+msgstr "控制器版本"
+
+msgid "Cooling management"
+msgstr "散热管理"
+
+msgid "Cooling policy saved and applied."
+msgstr "散热策略已保存并应用。"
+
+msgid "Cooling state"
+msgstr "散热状态"
+
+msgid "cooling state %s / %s"
+msgstr "散热状态 %s / %s"
 
 msgid "CPU"
 msgstr "CPU"
@@ -142,59 +133,47 @@ msgstr "CPU"
 msgid "CPU only"
 msgstr "仅 CPU"
 
-msgid "Checking service…"
-msgstr "正在检查服务…"
+msgid "CPU throttling intact"
+msgstr "CPU 降频保护"
 
-msgid "Choose a cooling profile or set a manual output. Safety limits remain active in every mode."
-msgstr "选择散热方案或设置手动输出。所有模式都会保留安全限制。"
+msgid "Critical"
+msgstr "过热"
 
-msgid "Comma-separated temperature:percent points. The controller interpolates between points."
-msgstr "使用逗号分隔“温度:百分比”控制点，控制器会在各点之间插值。"
-
-msgid "Control interval"
-msgstr "控制间隔"
-
-msgid "Control temperature"
-msgstr "控制温度"
-
-msgid "Current input: %s"
-msgstr "当前依据：%s"
-
-msgid "Controller running · updated %ss ago"
-msgstr "控制器运行正常 · %s 秒前更新"
-
-msgid "Controller status is stale"
-msgstr "控制器状态已过期"
-
-msgid "Cooling management"
-msgstr "散热管理"
-
-msgid "Automatically balances cooling and noise based on device temperatures."
-msgstr "根据设备温度自动调节风扇，兼顾散热与安静。"
-
-msgid "Checking…"
-msgstr "正在检查…"
-
-msgid "Cooling policy"
-msgstr "散热策略"
-
-msgid "Cooling policy applied successfully."
-msgstr "散热策略已成功应用。"
-
-msgid "Cooling profile"
-msgstr "散热方案"
-
-msgid "Cooling state %s / %s"
-msgstr "散热状态 %s / %s"
+msgid "Curve failsafe"
+msgstr "曲线故障保护"
 
 msgid "Custom"
 msgstr "自定义"
 
-msgid "Custom curve"
-msgstr "自定义曲线"
+msgid "Custom curve nodes"
+msgstr "自定义曲线节点"
 
-msgid "Effective fan policy"
-msgstr "当前生效的风扇策略"
+msgid "Daemon running"
+msgstr "守护进程运行中"
+
+msgid "daemon snapshot"
+msgstr "守护进程快照"
+
+msgid "Default: %s · range %d–%d."
+msgstr "默认值：%s · 范围 %d–%d。"
+
+msgid "Delayed"
+msgstr "延迟"
+
+msgid "Delete node"
+msgstr "删除节点"
+
+msgid "Diagnostics"
+msgstr "诊断"
+
+msgid "disabled"
+msgstr "已停用"
+
+msgid "Drag the dots in the chart or edit the table. Click an empty spot to add a node; double-click a node to remove it."
+msgstr "拖动图表中的圆点或直接编辑表格；点击空白处添加节点，双击节点将其删除。"
+
+msgid "Editing the custom curve. Invalid combinations are rejected before saving; the interpolation matches the controller exactly."
+msgstr "正在编辑自定义曲线。无效组合会在保存前被拒绝；插值算法与控制器完全一致。"
 
 msgid "Enable enhanced controller"
 msgstr "启用增强控制器"
@@ -205,29 +184,89 @@ msgstr "以太网 PHY"
 msgid "Failed to apply cooling policy:"
 msgstr "散热策略应用失败："
 
-msgid "Failsafe active · full cooling"
-msgstr "故障保护已启用 · 全速散热"
+msgid "FAILSAFE"
+msgstr "故障保护"
 
-msgid "Failsafe cooling"
+msgid "Failsafe cooling active"
 msgstr "安全散热中"
 
-msgid "Status delayed"
-msgstr "状态延迟"
+msgid "Failsafe cooling is active (%s). The controller detected a problem and drives a high output until it recovers."
+msgstr "故障保护散热已启用（%s）。控制器检测到异常，将持续高转速输出直至恢复。"
 
-msgid "Running normally"
-msgstr "运行正常"
+msgid "Fan control"
+msgstr "风扇控制"
 
-msgid "Fan output"
-msgstr "风扇输出"
+msgid "Fan Control"
+msgstr "风扇控制"
 
-msgid "From the local modem cache"
-msgstr "来自本地模块缓存"
+msgid "Fan curve"
+msgstr "风扇曲线"
 
-msgid "H5000M Cooling"
-msgstr "H5000M 散热管理"
+msgid "Fan Curve"
+msgstr "风扇曲线"
 
-msgid "Hottest available sensor"
-msgstr "可用传感器中的最高温度"
+msgid "Fan curve: %d points from %d degrees at %d%% to %d degrees at %d%%"
+msgstr "风扇曲线：共 %d 个节点，从 %d 度 %d%% 到 %d 度 %d%%"
+
+msgid "Fan illustration: %s, driven at %s"
+msgstr "风扇示意：%s，驱动输出 %s"
+
+msgid "Fan ownership"
+msgstr "风扇控制权"
+
+msgid "Fan speed"
+msgstr "风扇转速"
+
+msgid "Fan status illustration"
+msgstr "风扇状态示意图"
+
+msgid "Fault"
+msgstr "故障"
+
+msgid "Healthy"
+msgstr "健康"
+
+msgid "holding"
+msgstr "保持中"
+
+msgid "holding output"
+msgstr "输出保持中"
+
+msgid "Hot"
+msgstr "高温"
+
+msgid "Hottest sensor"
+msgstr "最高温度传感器"
+
+msgid "Hottest sensor considers CPU, Ethernet PHY, Wi-Fi radios and the 5G modem cache."
+msgstr "最高温度模式综合 CPU、以太网 PHY、Wi-Fi 射频和 5G 模组缓存温度。"
+
+msgid "inactive"
+msgstr "未触发"
+
+msgid "Invalid curve - check the node table"
+msgstr "曲线无效——请检查节点表"
+
+msgid "Invalid fan curve"
+msgstr "风扇曲线无效"
+
+msgid "Invalid value."
+msgstr "无效的取值。"
+
+msgid "Kernel floor"
+msgstr "内核下限"
+
+msgid "kernel floor %d%%"
+msgstr "内核下限 %d%%"
+
+msgid "Kernel governor"
+msgstr "内核调速策略"
+
+msgid "Kernel only"
+msgstr "仅内核"
+
+msgid "Kernel protection"
+msgstr "内核保护"
 
 msgid "Kernel protection only"
 msgstr "仅内核保护"
@@ -235,107 +274,287 @@ msgstr "仅内核保护"
 msgid "Kernel safety floor"
 msgstr "内核安全下限"
 
-msgid "Kernel thermal protection is always retained. Requested output may be raised automatically when the kernel requires more cooling."
-msgstr "内核温控保护始终保留；当内核需要更多散热时，实际输出会自动高于请求值。"
+msgid "Kernel thermal protection"
+msgstr "内核温控保护"
 
-msgid "Live fan policy, temperature sensors and kernel safety protection."
-msgstr "实时查看风扇策略、温度传感器和内核安全保护。"
+msgid "Kernel thermal protection is always retained; when the kernel requires more cooling the effective output is raised automatically."
+msgstr "内核温控保护始终保留；当内核需要更多散热时，实际输出会自动提高。"
 
-msgid "Loading…"
-msgstr "正在载入…"
+msgid "Kick-off pulse used when the fan restarts from standstill."
+msgstr "风扇从停转状态重新启动时使用的助推脉冲。"
+
+msgid "Last error"
+msgstr "最后错误"
+
+msgid "Last success"
+msgstr "最后成功采样"
+
+msgid "Legacy modem cache"
+msgstr "旧版模组缓存"
+
+msgid "Live fan policy, temperature sensors and kernel safety protection for the H5000M."
+msgstr "H5000M 的实时风扇策略、温度传感器与内核安全保护。"
+
+msgid "Live output"
+msgstr "实时输出"
+
+msgid "live query"
+msgstr "实时查询"
+
+msgid "Manual"
+msgstr "手动"
+
+msgid "Manual PWM below 80 may be too low to keep the fan spinning. Continue?"
+msgstr "手动 PWM 低于 80 可能无法维持风扇转动。是否继续？"
 
 msgid "Manual PWM output"
 msgstr "手动 PWM 输出"
 
-msgid "No tachometer signal is exposed by the hardware/driver"
-msgstr "硬件或驱动没有提供转速脉冲信号"
+msgid "Manual request"
+msgstr "手动请求"
+
+msgid "Modem manager cache"
+msgstr "模组管理器缓存"
+
+msgid "Must be 0 or 1."
+msgstr "取值必须为 0 或 1。"
+
+msgid "Native hwmon"
+msgstr "原生 hwmon"
+
+msgid "Native thermal zone"
+msgstr "原生 thermal zone"
+
+msgid "no"
+msgstr "否"
+
+msgid "NO - user_space detected!"
+msgstr "否——检测到 user_space！"
+
+msgid "No data"
+msgstr "无数据"
+
+msgid "No data yet"
+msgstr "暂无数据"
+
+msgid "No valid control sensor"
+msgstr "没有有效的控制传感器"
 
 msgid "No valid sensor"
 msgstr "没有有效传感器"
 
-msgid "Not supported"
-msgstr "不支持"
+msgid "none"
+msgstr "无"
+
+msgid "Normal"
+msgstr "正常"
+
+msgid "Not available"
+msgstr "不可用"
+
+msgid "not waiting"
+msgstr "未在等待"
 
 msgid "Operating mode"
 msgstr "运行模式"
 
+msgid "Operating point"
+msgstr "运行点"
+
+msgid "Output used when no valid sensor reading or an invalid curve is detected."
+msgstr "检测不到有效传感器读数或曲线无效时使用的输出值。"
+
+msgid "Overview"
+msgstr "总览"
+
 msgid "Performance"
 msgstr "性能"
 
-msgid "Policy"
-msgstr "策略"
+msgid "Please confirm"
+msgstr "请确认"
 
-msgid "Policy reason"
-msgstr "策略原因"
+msgid "Please enter a non-negative integer."
+msgstr "请输入非负整数。"
 
 msgid "Prevents repeated speed changes around a curve point."
 msgstr "避免温度在曲线控制点附近波动时反复改变转速。"
 
+msgid "Problems found:"
+msgstr "发现以下问题："
+
 msgid "Quiet"
 msgstr "静音"
+
+msgid "Raw controller status (JSON)"
+msgstr "控制器原始状态（JSON）"
+
+msgid "Reason"
+msgstr "原因"
 
 msgid "Requested output"
 msgstr "请求输出"
 
-msgid "Response & safety"
-msgstr "响应与安全"
+msgid "requested: %s"
+msgstr "请求值：%s"
+
+msgid "Response and safety parameters"
+msgstr "响应与安全参数"
+
+msgid "Restart service"
+msgstr "重启服务"
+
+msgid "Restart the fan control service? The fan keeps its current output during the restart."
+msgstr "重启风扇控制服务？重启期间风扇保持当前输出。"
+
+msgid "Restore default"
+msgstr "恢复默认"
+
+msgid "Restore the default custom curve? Your current custom points will be replaced."
+msgstr "恢复默认自定义曲线？当前自定义节点将被替换。"
+
+msgid "Result"
+msgstr "结果"
+
+msgid "Run control cycle now"
+msgstr "立即执行控制循环"
+
+msgid "Running normally"
+msgstr "运行正常"
+
+msgid "Safety protection"
+msgstr "安全保护"
 
 msgid "Seconds between control decisions. The dashboard refreshes independently."
 msgstr "两次控制决策之间的秒数；仪表盘使用独立的刷新周期。"
 
+msgid "Sensor failsafe"
+msgstr "传感器故障保护"
+
+msgid "Sensor-failure PWM"
+msgstr "传感器故障 PWM"
+
+msgid "Service restart failed:"
+msgstr "服务重启失败："
+
+msgid "Service restarted."
+msgstr "服务已重启。"
+
+msgid "Settings saved. The controller picks them up within one control interval."
+msgstr "设置已保存。控制器会在一个控制周期内自动加载新配置。"
+
+msgid "Shared with kernel"
+msgstr "与内核共享"
+
+msgid "Showing the %s preset from the saved configuration. Switch to Custom to edit your own points."
+msgstr "正在显示已保存配置中的「%s」预设。切换到「自定义」可编辑自己的控制点。"
+
 msgid "Speed-down delay"
 msgstr "降速延迟"
 
-msgid "Startup boost PWM"
-msgstr "启动助推 PWM"
+msgid "Stale status"
+msgstr "状态已过期"
 
 msgid "Startup boost duration"
 msgstr "启动助推时长"
 
+msgid "Startup boost PWM"
+msgstr "启动助推 PWM"
+
+msgid "State age"
+msgstr "状态时效"
+
+msgid "Status delayed"
+msgstr "状态延迟"
+
+msgid "Status source"
+msgstr "状态来源"
+
+msgid "STOPPED"
+msgstr "已停止"
+
+msgid "System Settings"
+msgstr "系统设置"
+
+msgid "target %s"
+msgstr "目标 %s"
+
+msgid "Target output"
+msgstr "目标输出"
+
+msgid "Temperature"
+msgstr "温度"
+
 msgid "Temperature hysteresis"
 msgstr "温度滞回"
 
-msgid "Temperatures must increase from 0–150 °C and percentages must be 0–100."
-msgstr "温度必须在 0–150 °C 范围内递增，百分比必须在 0–100 范围内。"
+msgid "Temperature monitoring"
+msgstr "温度监控"
 
-msgid "The hottest-sensor option considers CPU, Ethernet PHY, Wi-Fi and the available 5G modem cache."
-msgstr "最高温度模式会综合 CPU、以太网 PHY、Wi-Fi 和可用的 5G 模块缓存温度。"
+msgid "Temperature unknown"
+msgstr "温度未知"
 
-msgid "The kernel safety floor may raise the effective output above this value."
-msgstr "内核安全下限可能使实际输出高于此设置值。"
+msgid "Temperatures"
+msgstr "温度"
 
-msgid "Unavailable"
-msgstr "不可用"
+msgid "The enhanced controller is about to be disabled. The fan will follow the kernel thermal policy only. Continue?"
+msgstr "即将停用增强控制器。风扇将仅跟随内核温控策略。是否继续？"
 
-msgid "Use comma-separated temperature:percent points, for example 35:0,45:50,70:80,90:100."
-msgstr "请使用逗号分隔“温度:百分比”控制点，例如 35:0,45:50,70:80,90:100。"
+msgid "The fan manager owns the fan policy. Kernel CPU throttling and hot/critical over-temperature protection remain active."
+msgstr "风扇管理器独占风扇策略控制；内核 CPU 降频及高温/临界过热保护仍保持启用。"
 
-msgid "Wait this many seconds before lowering fan output; temperature increases are applied immediately."
+msgid "Thermal zone"
+msgstr "温区"
+
+msgid "These parameters never bypass kernel protection: CPU throttling, hot and critical trips stay under kernel control in every mode."
+msgstr "这些参数绝不会绕过内核保护：无论何种模式，CPU 降频、高温与临界温控点始终由内核管理。"
+
+msgid "unknown"
+msgstr "未知"
+
+msgid "Unknown"
+msgstr "未知"
+
+msgid "UNKNOWN"
+msgstr "未知"
+
+msgid "unknown output"
+msgstr "输出未知"
+
+msgid "Unsaved changes have been discarded."
+msgstr "未保存的修改已放弃。"
+
+msgid "unsupported"
+msgstr "不支持"
+
+msgid "Use comma-separated temperature:percent points, e.g. 35:0,45:50,70:80,90:100. Temperatures must rise, 0–150°C, percentages 0–100."
+msgstr "请使用逗号分隔的「温度:百分比」控制点，例如 35:0,45:50,70:80,90:100。温度必须递增（0–150°C），百分比范围为 0–100。"
+
+msgid "Userspace (kernel CPU throttling intact)"
+msgstr "用户空间（内核 CPU 降频保护完整）"
+
+msgid "Vendor driver (iwpriv)"
+msgstr "厂商驱动（iwpriv）"
+
+msgid "Wait this many seconds before lowering fan output; increases apply immediately."
 msgstr "降低风扇输出前等待指定秒数；温度升高会立即响应。"
-
-msgid "When disabled, the fan follows the kernel thermal protection level only."
-msgstr "关闭后，风扇将仅跟随内核温控保护等级。"
-
-msgid "Wi-Fi radios"
-msgstr "Wi-Fi 射频"
-
-msgid "%s · kernel safety floor"
-msgstr "%s · 内核安全下限"
 
 msgid "Waiting before speed down"
 msgstr "等待降速"
 
-msgid "Automatic curve"
-msgstr "自动曲线"
+msgid "Warning: the CPU thermal governor reports user_space. Kernel CPU throttling may be disabled - check your firmware and the controller release notes."
+msgstr "警告：CPU 温控调速器报告为 user_space，内核 CPU 降频保护可能已被禁用——请检查固件与控制器版本说明。"
 
-msgid "Manual request"
-msgstr "手动请求"
+msgid "When disabled, the fan follows the kernel thermal protection level only."
+msgstr "停用后，风扇将仅跟随内核温控保护等级。"
 
-msgid "Kernel protection"
-msgstr "内核保护"
+msgid "Wi-Fi radio 1"
+msgstr "Wi-Fi 射频 1"
 
-msgid "Sensor failsafe"
-msgstr "传感器故障保护"
+msgid "Wi-Fi radio 2"
+msgstr "Wi-Fi 射频 2"
 
-msgid "Curve failsafe"
-msgstr "曲线故障保护"
+msgid "Wi-Fi radios"
+msgstr "Wi-Fi 射频"
+
+msgid "yes"
+msgstr "是"
