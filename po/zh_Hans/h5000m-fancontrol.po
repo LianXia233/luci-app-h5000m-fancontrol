@@ -1,6 +1,6 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-h5000m-fancontrol 3.1.0\n"
+"Project-Id-Version: luci-app-h5000m-fancontrol 3.2.0\n"
 "POT-Creation-Date: 2026-10-25 12:00+0800\n"
 "PO-Revision-Date: 2026-10-25 12:00+0800\n"
 "Last-Translator: \n\n"
