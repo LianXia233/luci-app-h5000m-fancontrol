@@ -1058,9 +1058,12 @@ return view.extend({
 			'.h5fan-panel-sub{margin:-6px 0 0;font-size:11.5px;line-height:1.5;color:var(--text-color-medium,#666)}',
 			'.h5fan-span12{grid-column:span 12}.h5fan-span8{grid-column:span 8}.h5fan-span7{grid-column:span 7}',
 			'.h5fan-span6{grid-column:span 6}.h5fan-span5{grid-column:span 5}.h5fan-span4{grid-column:span 4}',
-			'@media(max-width:1000px){.h5fan-span8,.h5fan-span7,.h5fan-span6,.h5fan-span5,.h5fan-span4{grid-column:span 12}}',
+			'.h5fan-span3{grid-column:span 3}',
+			'@media(max-width:1000px){.h5fan-span8,.h5fan-span7,.h5fan-span6,.h5fan-span5,.h5fan-span4,.h5fan-span3{grid-column:span 12}}',
 			'@media(max-width:640px){.h5fan-pane{gap:10px}.h5fan-head h2{font-size:18px}}',
 			'.h5fan-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:10px}',
+			'.h5fan-stats-capped{grid-template-columns:repeat(auto-fit,minmax(150px,280px))}',
+			'.h5fan-panel > .h5fan-stats:last-child{flex:1 1 auto;min-height:0}',
 			'.h5fan-kv{padding:11px 12px;display:flex;flex-direction:column;gap:4px;min-width:0}',
 			'.h5fan-kv-label{font-size:11.5px;color:var(--text-color-medium,#666)}',
 			'.h5fan-kv-value{font-size:19px;font-weight:650;word-break:break-word}',
@@ -1548,16 +1551,16 @@ return view.extend({
 		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span3' }, [
 			E('h3', {}, [ _('Status') ]),
 			this.overviewBadges,
-			this.overviewRows
+			this.overviewRows,
+			E('div', { 'class': 'h5fan-stats h5fan-stats-capped' }, [
+				stats.control.node, stats.reason.node
+			])
 		]));
 
 		this.overviewBars = this.mountBars(E('div', { 'class': 'h5fan-bars' }));
 
 		pane.appendChild(E('div', { 'class': 'h5fan-panel h5fan-span12' }, [
 			E('h3', {}, [ _('Temperatures') ]),
-			E('div', { 'class': 'h5fan-stats' }, [
-				stats.control.node, stats.reason.node
-			]),
 			this.overviewBars
 		]));
 	},
