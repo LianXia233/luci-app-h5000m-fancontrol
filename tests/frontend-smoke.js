@@ -531,8 +531,8 @@ async function main() {
 
 	check('no RPM figure is invented when the board has no tachometer',
 		!/RPM/.test(flatText), 'rpm_available is false, so no number may appear');
-	check('the tachometer card states that the board has no feedback',
-		/No feedback/.test(flatText));
+	check('the board without a tachometer shows no tachometer card',
+		!/Tachometer|No feedback/.test(flatText));
 
 	const moduleBar = barSvg[4];
 	const moduleFill = collect(moduleBar).find((node) => node.tagName === 'RECT'

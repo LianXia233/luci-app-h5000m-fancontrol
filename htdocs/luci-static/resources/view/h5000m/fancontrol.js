@@ -1519,8 +1519,7 @@ return view.extend({
 			[ 'requested', _('Requested') ],
 			[ 'target', _('Target') ],
 			[ 'actual', _('Register readback') ],
-			[ 'floor', _('Kernel floor') ],
-			[ 'rpm', _('Tachometer') ]
+			[ 'floor', _('Kernel floor') ]
 		].forEach(function(spec) {
 			var value = E('div', { 'class': 'h5fan-kv-value' }, [ '\u2014' ]);
 			var hint = E('div', { 'class': 'h5fan-kv-hint' }, [ '' ]);
@@ -1554,7 +1553,7 @@ return view.extend({
 				E('div', { 'class': 'h5fan-node' }, [ this.charts.target ])
 			]),
 			E('div', { 'class': 'h5fan-stats' }, [
-				stats.requested.node, stats.actual.node, stats.floor.node, stats.rpm.node
+				stats.requested.node, stats.actual.node, stats.floor.node
 			])
 		]));
 
@@ -1899,10 +1898,6 @@ return view.extend({
 				known(live) ? _('read back from %s').format(fan.pwm_path || 'pwm1') : _('Unavailable'));
 			this.stats.floor.set(known(thermal.floor_pwm) ? '%d%%'.format(percentOfPwm(thermal.floor_pwm)) : '\u2014',
 				thermal.basis || '', thermal.floor_pwm > 0 ? 'warn' : null);
-			this.stats.rpm.set(
-				fan.rpm_available && known(fan.rpm) ? '%d RPM'.format(fan.rpm) : _('No feedback'),
-				fan.rpm_available ? _('Reported by the tachometer') : _('This board exposes no tachometer reading'),
-				fan.rpm_available ? null : 'warn');
 			this.stats.reason.set(reasonName(fan.reason), controller.result ? _('result: %s').format(controller.result) : '');
 			this.stats.control.set(known(this.status.control.temp_c) ? formatTemp(this.status.control.temp_c) : '\u2014',
 				this.status.control.sensor_label || _('No valid sensor'),
