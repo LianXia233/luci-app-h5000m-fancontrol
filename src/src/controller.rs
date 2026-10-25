@@ -1,620 +1,771 @@
-//! One fan control decision (the former shell `apply_once`).
+//! Control policy: decide what the fan should do, then apply it.
 //!
-//! Decision order, hysteresis handling, down-delay semantics, start boost and
-//! the kernel safety floor all reproduce the audited shell behaviour. The only
-//! intentional changes: hard failures additionally persist an `error` state so
-//! the LuCI diagnostics page can explain them, and the start-boost sleep is
-//! chunked so signals are honoured promptly.
+//! [`decide`] is pure: the same settings, sensors, floor and previous output
+//! always produce the same target. That is what makes the hysteresis,
+//! spin-down delay and failsafe paths testable without touching hardware.
+//! [`actuate`] is the only place that writes a PWM register, and [`run_cycle`]
+//! wires the pieces together for both the daemon and `h5000m-fancontrol apply`.
 
-use crate::config::{Config, Mode};
-use crate::curve;
-use crate::fan;
+use crate::config::{Mode, Settings};
+use crate::curve::{self, CurvePoint};
+use crate::error::{Error, Result};
+use crate::fan::{self, FanDevice};
 use crate::paths::Paths;
-use crate::safety::{thermal_floor, ThermalOwner};
-use crate::sensor::{SensorReader, VendorRadio};
-use crate::state::ControllerState;
-use crate::thermal;
+use crate::safety::{self, Ownership};
+use crate::sensor::{self, RadioProbe, SensorId, SensorReading, Sensors};
+use crate::state::{ControlResult, Snapshot};
+use std::time::Duration;
 
-pub struct Controller<'a> {
-    pub paths: &'a Paths,
+/// Reason codes are wire compatible with the 2.x controller: the LuCI view and
+/// any external script keep matching on exactly these strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    Auto,
+    Manual,
+    Kernel,
+    SensorFailsafe,
+    CurveFailsafe,
+    AutoDownDelay,
+    PwmMissing,
+    WriteFailed,
+    CycleFailed,
 }
 
+impl Reason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Reason::Auto => "auto",
+            Reason::Manual => "manual",
+            Reason::Kernel => "kernel",
+            Reason::SensorFailsafe => "sensor-failsafe",
+            Reason::CurveFailsafe => "curve-failsafe",
+            Reason::AutoDownDelay => "auto-down-delay",
+            Reason::PwmMissing => "pwm-missing",
+            Reason::WriteFailed => "pwm-write-failed",
+            Reason::CycleFailed => "cycle-failed",
+        }
+    }
+
+    pub fn with_floor(self, floor_applied: bool) -> String {
+        if floor_applied {
+            format!("{}+kernel-floor", self.code())
+        } else {
+            self.code().to_string()
+        }
+    }
+}
+
+/// A snapshot older than this is not trusted for the spin-down memory, because
+/// the fan may have been driven by the kernel in the meantime.
+pub const TRUST_STATE_SECONDS: u64 = 300;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleInput<'a> {
+    pub settings: &'a Settings,
+    pub sensors: &'a Sensors,
+    pub floor: u8,
+    pub current_pwm: u8,
+    /// `applied_pwm` from a still trusted snapshot, if any.
+    pub last_applied: Option<u8>,
+    pub down_since: u64,
+    pub now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
-    pub requested_pwm: u32,
-    pub target_pwm: u32,
-    pub reason: String,
-    pub result: &'static str,
+    pub requested: u8,
+    pub target: u8,
+    pub reason: Reason,
+    pub result: ControlResult,
+    pub kernel_floor_applied: bool,
+    pub down_since: u64,
+    /// The target was held at the previous output to avoid a premature slowdown.
+    pub holding_previous: bool,
+    pub control_temp: Option<i32>,
+    pub control_sensor: Option<String>,
+    pub control_source: Option<String>,
+    pub notes: Vec<String>,
 }
 
-impl<'a> Controller<'a> {
-    pub fn new(paths: &'a Paths) -> Self {
-        Controller { paths }
+impl Decision {
+    pub fn reason_text(&self) -> String {
+        self.reason.with_floor(self.kernel_floor_applied)
     }
+}
 
-    /// Runs a single control cycle. `sleep` blocks for the start-boost
-    /// duration (in whole seconds) and is injected so tests run instantly.
-    pub fn apply_once(
-        &self,
-        cfg: &Config,
-        vendor: &mut dyn VendorRadio,
-        now: u64,
-        sleep: &dyn Fn(u64),
-    ) -> Result<(), String> {
-        let Some(pwm_path) = fan::find_pwm(&self.paths.pwm_root) else {
-            let message = "PWM control node not found; unable to apply policy".to_string();
-            log(&message);
-            self.write_error_state(now, "pwm-not-found", &message);
-            return Err(message);
-        };
+fn apply_floor(requested: u8, floor: u8, notes: &mut Vec<String>) -> (u8, bool) {
+    if floor > requested {
+        notes.push(format!("kernel floor {floor}/255 raised the request"));
+        (floor, true)
+    } else {
+        (requested, false)
+    }
+}
 
-        let sensors = SensorReader::new(self.paths).read(cfg.temp_source, vendor, now);
-        let floor = thermal_floor(self.paths, &pwm_path, sensors.cpu.temp);
+fn failsafe(settings: &Settings, floor: u8, reason: Reason, note: String) -> Decision {
+    let mut notes = vec![note];
+    let (target, raised) = apply_floor(settings.fail_pwm, floor, &mut notes);
+    Decision {
+        requested: settings.fail_pwm,
+        target,
+        reason,
+        result: ControlResult::Failsafe,
+        kernel_floor_applied: raised,
+        down_since: 0,
+        holding_previous: false,
+        control_temp: None,
+        control_sensor: None,
+        control_source: None,
+        notes,
+    }
+}
 
-        let mut decision = Decision {
-            requested_pwm: 0,
-            target_pwm: 0,
-            reason: match cfg.mode {
-                Mode::Auto => "auto",
-                Mode::Manual => "manual",
-                Mode::Kernel => "kernel",
-            }
-            .to_string(),
-            result: "ok",
-        };
-        let mut down_since: u64 = 0;
-        let mut owner = floor.owner.clone();
+/// Pure policy evaluation for one cycle.
+pub fn decide(input: &CycleInput) -> Decision {
+    let settings = input.settings;
+    let mut notes = Vec::new();
+    let control = input
+        .sensors
+        .control(settings)
+        .map(|(reading, value)| (value, reading.label.clone(), reading.source.clone()));
 
-        if !cfg.enabled || cfg.mode == Mode::Kernel {
-            thermal::release_thermal_control(self.paths);
-            let current = fan::read_pwm(&pwm_path).unwrap_or(0);
-            decision.requested_pwm = 0;
-            decision.target_pwm = current;
-            let state = ControllerState {
-                updated: Some(now),
-                result: "ok".into(),
-                reason: "kernel".into(),
-                requested_pwm: Some(0),
-                target_pwm: Some(current),
-                applied_pwm: Some(current),
-                thermal_floor: Some(floor.floor),
-                thermal_state: Some(floor.state),
-                thermal_max_state: Some(floor.max_state),
-                thermal_owner: ThermalOwner::Kernel.as_str().into(),
-                control_temp: sensors.control.as_ref().and_then(|c| c.temp),
-                control_sensor: sensors
-                    .control
-                    .as_ref()
-                    .map(|c| c.label.clone())
-                    .unwrap_or_default(),
-                down_since: Some(0),
-                last_error: String::new(),
-            };
-            let _ = state.write(&self.paths.state_file());
-            return Ok(());
-        }
-
-        let control_state = thermal::take_thermal_control(self.paths);
-        if let Err(message) = control_state {
-            let message = format!(
-                "unable to inspect kernel thermal policy ({message}); cooling policy not changed"
-            );
-            log(&message);
-            thermal::release_thermal_control(self.paths);
-            self.write_error_state(now, "thermal-inspect-failed", &message);
-            return Err(message);
-        }
-        if owner == ThermalOwner::Unknown {
-            owner = ThermalOwner::UserspacePwm;
-        }
-
-        let curve_points = curve::parse_curve(cfg.curve_data());
-        match cfg.mode {
-            Mode::Manual => {
-                decision.requested_pwm = cfg.manual_pwm;
-                decision.reason = "manual".into();
-            }
-            _ => match sensors.control.as_ref().and_then(|c| c.temp) {
-                None => {
-                    decision.requested_pwm = cfg.fail_pwm;
-                    decision.reason = "sensor-failsafe".into();
-                    decision.result = "failsafe";
-                }
-                Some(control_temp) => match curve_points
-                    .as_deref()
-                    .and_then(|points| curve::curve_pwm(control_temp, points))
-                {
-                    Some(pwm) => {
-                        decision.requested_pwm = pwm;
-                        decision.reason = "auto".into();
-                    }
-                    None => {
-                        decision.requested_pwm = cfg.fail_pwm;
-                        decision.reason = "curve-failsafe".into();
-                        decision.result = "failsafe";
-                    }
-                },
-            },
-        }
-
-        decision.requested_pwm = decision.requested_pwm.clamp(0, 255);
-        decision.target_pwm = decision.requested_pwm;
-        if floor.floor > decision.target_pwm {
-            decision.target_pwm = floor.floor;
-            decision.reason.push_str("+kernel-floor");
-        }
-
-        let current = fan::read_pwm(&pwm_path).unwrap_or(0);
-        let previous = ControllerState::read(&self.paths.state_file());
-        let last_pwm = previous.applied_pwm.unwrap_or(current);
-
-        if cfg.mode == Mode::Auto && decision.result == "ok" && decision.target_pwm < last_pwm {
-            // Delay speed reductions: re-evaluate the curve at
-            // temp+hysteresis and hold the previous output until the delay
-            // elapses.
-            let control_temp = sensors
-                .control
-                .as_ref()
-                .and_then(|c| c.temp)
-                .unwrap_or_default();
-            let mut candidate = curve_points
-                .as_deref()
-                .and_then(|points| curve::curve_pwm(control_temp + cfg.hysteresis as i32, points))
-                .unwrap_or(decision.target_pwm);
-            if floor.floor > candidate {
-                candidate = floor.floor;
-            }
-            decision.target_pwm = candidate;
-            down_since = previous.down_since.filter(|v| *v > 0).unwrap_or(now);
-            if now.saturating_sub(down_since) < cfg.down_delay as u64 {
-                decision.target_pwm = last_pwm;
-                decision.reason = "auto-down-delay".into();
+    if settings.is_kernel_only() {
+        let (control_temp, control_sensor, control_source) = control.clone().unwrap_or_default();
+        return Decision {
+            requested: 0,
+            target: input.current_pwm,
+            reason: Reason::Kernel,
+            result: ControlResult::Ok,
+            kernel_floor_applied: false,
+            down_since: 0,
+            holding_previous: false,
+            control_temp: if control_sensor.is_none() {
+                None
             } else {
-                down_since = 0;
-            }
-        }
-
-        decision.target_pwm = decision.target_pwm.clamp(0, 255);
-
-        if current == 0 && decision.target_pwm > 0 && cfg.start_boost_ms > 0 {
-            let boost = cfg.start_pwm.max(decision.target_pwm);
-            if fan::write_pwm(&pwm_path, boost).is_err() {
-                let message = format!("failed to write start boost pwm={boost}");
-                log(&message);
-                self.write_error_state(now, "pwm-write-failed", &message);
-                return Err(message);
-            }
-            // BusyBox sleep accepts whole seconds only.
-            sleep(cfg.start_boost_ms.div_ceil(1000) as u64);
-        }
-
-        if current != decision.target_pwm && fan::write_pwm(&pwm_path, decision.target_pwm).is_err()
-        {
-            let message = format!("failed to set PWM target={}", decision.target_pwm);
-            log(&message);
-            self.write_error_state(now, "pwm-write-failed", &message);
-            return Err(message);
-        }
-
-        let applied = fan::read_pwm(&pwm_path).unwrap_or(decision.target_pwm);
-        if decision.result != previous.result {
-            if decision.result == "failsafe" {
-                log(&format!(
-                    "failsafe enabled reason={} pwm={}",
-                    decision.reason, decision.target_pwm
-                ));
-            } else if previous.result == "failsafe" {
-                log("sensor and curve validation recovered; normal control resumed");
-            }
-        }
-
-        let state = ControllerState {
-            updated: Some(now),
-            result: decision.result.into(),
-            reason: decision.reason.clone(),
-            requested_pwm: Some(decision.requested_pwm),
-            target_pwm: Some(decision.target_pwm),
-            applied_pwm: Some(applied),
-            thermal_floor: Some(floor.floor),
-            thermal_state: Some(floor.state),
-            thermal_max_state: Some(floor.max_state),
-            thermal_owner: owner.as_str().into(),
-            control_temp: sensors.control.as_ref().and_then(|c| c.temp),
-            control_sensor: sensors
-                .control
-                .as_ref()
-                .map(|c| c.label.clone())
-                .unwrap_or_default(),
-            down_since: Some(down_since),
-            last_error: String::new(),
+                Some(control_temp)
+            },
+            control_sensor,
+            control_source,
+            notes: if settings.enabled {
+                vec!["kernel protection only mode".to_string()]
+            } else {
+                vec!["controller disabled; the kernel drives the fan".to_string()]
+            },
         };
-        state
-            .write(&self.paths.state_file())
-            .map_err(|e| format!("failed to write state file: {e}"))?;
-        Ok(())
     }
 
-    fn write_error_state(&self, now: u64, reason: &str, message: &str) {
-        let state = ControllerState {
-            updated: Some(now),
-            result: "error".into(),
-            reason: reason.into(),
-            last_error: message.into(),
-            ..ControllerState::default()
+    let Some((control_temp, control_label, control_source)) = control else {
+        return failsafe(
+            settings,
+            input.floor,
+            Reason::SensorFailsafe,
+            "no valid temperature sensor is readable".to_string(),
+        );
+    };
+
+    if settings.mode == Mode::Manual {
+        let (target, raised) = apply_floor(settings.manual_pwm, input.floor, &mut notes);
+        return Decision {
+            requested: settings.manual_pwm,
+            target,
+            reason: Reason::Manual,
+            result: ControlResult::Ok,
+            kernel_floor_applied: raised,
+            down_since: 0,
+            holding_previous: false,
+            control_temp: Some(control_temp),
+            control_sensor: control_label,
+            control_source,
+            notes,
         };
-        let _ = state.write(&self.paths.state_file());
+    }
+
+    let points: Vec<CurvePoint> = match settings.active_curve() {
+        Ok(points) => points,
+        Err(err) => {
+            return failsafe(
+                settings,
+                input.floor,
+                Reason::CurveFailsafe,
+                format!("curve {:?} is not usable: {err}", settings.curve_spec()),
+            );
+        }
+    };
+
+    let Some(base) = curve::pwm_for(&points, control_temp) else {
+        return failsafe(
+            settings,
+            input.floor,
+            Reason::CurveFailsafe,
+            "curve evaluation produced no output".to_string(),
+        );
+    };
+
+    let mut reason = Reason::Auto;
+    let mut target = base;
+    let mut kernel_floor_applied = false;
+    if input.floor > target {
+        target = input.floor;
+        kernel_floor_applied = true;
+        notes.push(format!(
+            "kernel floor {}/255 raised the request",
+            input.floor
+        ));
+    }
+    let mut down_since = 0u64;
+    let mut holding_previous = false;
+
+    let last = input.last_applied.unwrap_or(input.current_pwm);
+    // Only automatic control that is not in a failsafe may slow down, and only
+    // after the configured delay elapsed. Failsafe paths returned above.
+    if settings.mode == Mode::Auto && target < last {
+        let hysteresis_temp = control_temp.saturating_add(settings.hysteresis);
+        let mut candidate = curve::pwm_for(&points, hysteresis_temp).unwrap_or(target);
+        if input.floor > candidate {
+            candidate = input.floor;
+            kernel_floor_applied = true;
+        }
+        target = candidate;
+        let start = if input.down_since > 0 {
+            input.down_since
+        } else {
+            input.now
+        };
+        let elapsed = input.now.saturating_sub(start);
+        if elapsed < settings.down_delay {
+            target = last;
+            reason = Reason::AutoDownDelay;
+            holding_previous = true;
+            down_since = start;
+            notes.push(format!(
+                "holding the previous output for {} s",
+                settings.down_delay - elapsed
+            ));
+            if input.floor > target {
+                kernel_floor_applied = true;
+            }
+        }
+    }
+
+    Decision {
+        requested: base,
+        target,
+        reason,
+        result: ControlResult::Ok,
+        kernel_floor_applied,
+        down_since,
+        holding_previous,
+        control_temp: Some(control_temp),
+        control_sensor: control_label,
+        control_source,
+        notes,
     }
 }
 
-/// Fire-and-forget syslog line, matching `logger -t h5000m-fancontrol`.
-pub fn log(message: &str) {
-    let _ = std::process::Command::new("logger")
-        .arg("-t")
-        .arg(crate::LOG_TAG)
-        .arg(message)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actuation {
+    /// Values written, in order.
+    pub writes: Vec<u8>,
+    pub boost_applied: bool,
+    pub applied_pwm: u8,
+    /// Whether the register reads back exactly what was written. A driver that
+    /// clamps the value is reported honestly instead of silently.
+    pub verified: bool,
+}
+
+/// Write the decision to hardware.
+///
+/// `pause` is injected so the startup boost can be tested without sleeping and
+/// so the daemon can cut a boost short when it is asked to stop.
+pub fn actuate(
+    fan: &FanDevice,
+    settings: &Settings,
+    decision: &Decision,
+    current_pwm: Option<u8>,
+    pause: &mut dyn FnMut(Duration),
+) -> Result<Actuation> {
+    let mut writes = Vec::new();
+    let mut boost_applied = false;
+    let target = decision.target;
+
+    // A register that cannot be read is treated as stopped, so the boost still
+    // runs: briefly over-driving a spinning fan is harmless, a fan that fails to
+    // start is not.
+    if current_pwm.unwrap_or(0) == 0 && target > 0 && settings.start_boost_ms > 0 {
+        let boost = settings.start_pwm.max(target);
+        fan.write_pwm(boost)?;
+        writes.push(boost);
+        boost_applied = true;
+        pause(Duration::from_millis(settings.start_boost_ms));
+    }
+
+    if current_pwm != Some(target) {
+        let readback = fan.write_pwm(target)?;
+        writes.push(target);
+        return Ok(Actuation {
+            writes,
+            boost_applied,
+            applied_pwm: readback,
+            verified: readback == target,
+        });
+    }
+
+    Ok(Actuation {
+        writes,
+        boost_applied,
+        applied_pwm: fan.read_pwm().unwrap_or(target),
+        verified: true,
+    })
+}
+
+/// One complete control cycle, including publishing the state snapshot.
+pub fn run_cycle(
+    paths: &Paths,
+    probe: &dyn RadioProbe,
+    previous: Option<&Snapshot>,
+    now: u64,
+    pause: &mut dyn FnMut(Duration),
+) -> Snapshot {
+    let settings = match Settings::load(paths) {
+        Ok(settings) => settings,
+        Err(err) => {
+            return failure_snapshot(
+                Snapshot::default(),
+                Reason::CycleFailed,
+                &err,
+                previous,
+                now,
+            );
+        }
+    };
+
+    let Some(device) = fan::discover(paths) else {
+        let snapshot = failure_snapshot(
+            Snapshot::default(),
+            Reason::PwmMissing,
+            &Error::PwmMissing,
+            previous,
+            now,
+        );
+        return with_settings(snapshot, &settings, now, previous);
+    };
+
+    let sensors = sensor::sample_all(paths, probe, now);
+    let floor = safety::evaluate_floor(paths, &device, sensors.value(SensorId::Cpu));
+    let current_pwm = device.read_pwm();
+    let trusted_previous = match previous {
+        Some(snapshot)
+            if snapshot.updated > 0
+                && now.saturating_sub(snapshot.updated) <= TRUST_STATE_SECONDS =>
+        {
+            Some(snapshot)
+        }
+        _ => None,
+    };
+
+    let input = CycleInput {
+        settings: &settings,
+        sensors: &sensors,
+        floor: floor.floor_pwm,
+        current_pwm: current_pwm.unwrap_or(0),
+        last_applied: trusted_previous.map(|snapshot| snapshot.applied_pwm),
+        down_since: trusted_previous
+            .map(|snapshot| snapshot.down_since)
+            .unwrap_or(0),
+        now,
+    };
+    let decision = decide(&input);
+
+    let mut snapshot = Snapshot::published_now(now);
+    snapshot.thermal_floor = floor.floor_pwm;
+    snapshot.thermal_state = floor.thermal_state;
+    snapshot.thermal_max_state = floor.max_state;
+    snapshot.thermal_owner = if settings.is_kernel_only() {
+        Ownership::Kernel.as_str().to_string()
+    } else {
+        floor.ownership.as_apply_str().to_string()
+    };
+    snapshot.thermal_basis = floor.basis.clone();
+    snapshot.pwm_path = Some(device.pwm_path.display().to_string());
+    snapshot.fan_path = device.rpm_path.as_ref().map(|p| p.display().to_string());
+    snapshot.rpm = device.read_rpm();
+    snapshot.sensors = sensors.readings.clone();
+    snapshot.control_temp = decision.control_temp;
+    snapshot.control_sensor = decision.control_sensor.clone();
+    snapshot.control_source = decision.control_source.clone();
+
+    if settings.is_kernel_only() {
+        // Nothing is written: the kernel owns the output. Report what is there.
+        snapshot.applied_pwm = current_pwm.unwrap_or(0);
+        snapshot.target_pwm = snapshot.applied_pwm;
+        snapshot.requested_pwm = 0;
+        snapshot.reason = decision.reason_text();
+        snapshot.result = decision.result;
+        snapshot.down_since = 0;
+        snapshot.last_error = previous
+            .filter(|p| p.result == ControlResult::Error)
+            .and_then(|p| p.last_error.clone());
+        return with_settings(snapshot, &settings, now, previous);
+    }
+
+    match actuate(&device, &settings, &decision, current_pwm, pause) {
+        Ok(actuation) => {
+            snapshot.requested_pwm = decision.requested;
+            snapshot.target_pwm = decision.target;
+            snapshot.applied_pwm = actuation.applied_pwm;
+            snapshot.reason = decision.reason_text();
+            snapshot.result = decision.result;
+            snapshot.kernel_floor_applied = decision.kernel_floor_applied;
+            snapshot.down_since = decision.down_since;
+            snapshot.boost_applied = actuation.boost_applied;
+            if !actuation.verified {
+                snapshot.last_error = Some(format!(
+                    "{} reads back {} instead of {}",
+                    device.pwm_path.display(),
+                    actuation.applied_pwm,
+                    decision.target
+                ));
+            } else {
+                snapshot.last_error = None;
+            }
+            with_settings(snapshot, &settings, now, previous)
+        }
+        Err(err) => {
+            let snapshot = failure_snapshot(snapshot, Reason::WriteFailed, &err, previous, now);
+            with_settings(snapshot, &settings, now, previous)
+        }
+    }
+}
+
+fn with_settings(
+    mut snapshot: Snapshot,
+    settings: &Settings,
+    now: u64,
+    previous: Option<&Snapshot>,
+) -> Snapshot {
+    snapshot.policy_signature = settings.policy_signature();
+    snapshot.cycle_count = previous.map(|p| p.cycle_count).unwrap_or(0) + 1;
+    snapshot.consecutive_failures = match snapshot.result {
+        ControlResult::Error => previous.map(|p| p.consecutive_failures).unwrap_or(0) + 1,
+        _ => 0,
+    };
+    snapshot.last_good_cycle = match snapshot.result {
+        ControlResult::Error => previous.map(|p| p.last_good_cycle).unwrap_or(0),
+        _ => now,
+    };
+    snapshot
+}
+
+/// Snapshot for a cycle that could not reach the hardware at all.
+pub fn failure_snapshot(
+    mut snapshot: Snapshot,
+    reason: Reason,
+    error: &Error,
+    previous: Option<&Snapshot>,
+    now: u64,
+) -> Snapshot {
+    snapshot.updated = now;
+    snapshot.pid = crate::platform::process_id();
+    snapshot.result = ControlResult::Error;
+    snapshot.reason = reason.code().to_string();
+    snapshot.last_error = Some(error.to_string());
+    snapshot.cycle_count = previous.map(|p| p.cycle_count).unwrap_or(0) + 1;
+    snapshot.consecutive_failures = previous.map(|p| p.consecutive_failures).unwrap_or(0) + 1;
+    snapshot.last_good_cycle = previous.map(|p| p.last_good_cycle).unwrap_or(0);
+    snapshot.thermal_owner = Ownership::Unknown.as_str().to_string();
+    snapshot
+}
+
+/// Publish the snapshot after a cycle, keeping the on-disk state consistent even
+/// when the write fails (the caller still gets the in-memory result).
+pub fn publish(paths: &Paths, snapshot: &Snapshot) -> Result<()> {
+    snapshot.write(&paths.state_file())
+}
+
+/// Helper used by the status report: rebuild a reading list when no snapshot
+/// exists yet (fresh install, or the daemon never ran). The rows stay present
+/// and explain themselves, instead of leaving a client to invent a default.
+pub fn placeholder_readings(sampled_at: u64) -> Vec<SensorReading> {
+    SensorId::all()
+        .iter()
+        .map(|id| {
+            SensorReading::new(*id, sampled_at).with_problem(
+                crate::sensor::SensorState::Missing,
+                "the controller has not published a sample yet".to_string(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default)] // test fixtures patch a few paths
 mod tests {
     use super::*;
-    use crate::paths::Paths;
-    use crate::sensor::NoVendor;
-    use crate::state::ControllerState;
-    use crate::uci::MapSource;
-    use std::collections::HashMap;
+    use crate::uci::UciFile;
 
-    fn write(path: &std::path::Path, content: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
+    fn cfg(text: &str) -> Settings {
+        Settings::from_uci(&UciFile::parse(&format!(
+            "config settings 'settings'\n{text}"
+        )))
     }
 
-    fn write_be32(path: &std::path::Path, words: &[u32]) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    /// Shared-ownership tree: pwm-fan with cooling-levels, kernel cooling map
-    /// that demands state 2 above 83°C, and a working CPU sensor.
-    fn fixture(tmp: &std::path::Path) -> Paths {
-        let _ = std::fs::remove_dir_all(tmp);
-        let mut paths = Paths::default();
-        paths.pwm_root = tmp.join("sys");
-        paths.sensor_root = tmp.join("sys");
-        paths.dt_root = tmp.join("dt");
-        paths.state_dir = tmp.join("run");
-        paths.lock_dir = tmp.join("lock/h5000m-fancontrol.lock");
-        paths.radio_root = tmp.join("net");
-        paths.module_cache = tmp.join("none/temperature");
-        paths.legacy_cache_dir = tmp.join("none-tmp");
-        std::fs::create_dir_all(&paths.state_dir).unwrap();
-
-        let hwmon = tmp.join("sys/class/hwmon/hwmon0");
-        write(&hwmon.join("name"), "pwmfan\n");
-        write(&hwmon.join("pwm1"), "0\n");
-        write(
-            &tmp.join("sys/class/thermal/thermal_zone0/type"),
-            "soc_thermal\n",
-        );
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "55000\n");
-        write(
-            &tmp.join("sys/class/thermal/thermal_zone0/policy"),
-            "step_wise\n",
-        );
-        write(
-            &tmp.join("sys/class/thermal/thermal_zone0/available_policies"),
-            "step_wise user_space\n",
-        );
-        let cooler = tmp.join("sys/class/thermal/cooling_device0");
-        write(&cooler.join("type"), "pwm-fan\n");
-        write(&cooler.join("max_state"), "3\n");
-
-        let fan_node = tmp.join("dt/pwm-fan");
-        write_be32(&fan_node.join("phandle"), &[0x2a]);
-        write_be32(&fan_node.join("cooling-levels"), &[0, 96, 160, 255]);
-        let zone = tmp.join("dt/thermal-zones/cpu-thermal");
-        write_be32(&zone.join("trips/trip-active/phandle"), &[0x11]);
-        write_be32(&zone.join("trips/trip-active/temperature"), &[83000]);
-        write_be32(&zone.join("trips/trip-active/hysteresis"), &[0]);
-        write_be32(&zone.join("cooling-maps/map0/cooling-device"), &[0x2a, 2]);
-        write_be32(&zone.join("cooling-maps/map0/trip"), &[0x11]);
-        paths
-    }
-
-    fn pwm_file(paths: &Paths) -> std::path::PathBuf {
-        paths.pwm_root.join("class/hwmon/hwmon0/pwm1")
-    }
-
-    fn read_pwm(paths: &Paths) -> String {
-        std::fs::read_to_string(pwm_file(paths))
-            .unwrap()
-            .trim()
-            .to_string()
-    }
-
-    fn controller(paths: &Paths) -> Controller<'_> {
-        Controller::new(paths)
-    }
-
-    const NO_SLEEP: fn(u64) = |_| {};
-
-    fn cfg_with(entries: &[(&str, &str)]) -> Config {
-        Config::load(&mut MapSource(
-            entries
+    fn sensors(values: [(SensorId, Option<i32>); 5]) -> Sensors {
+        Sensors {
+            readings: values
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<HashMap<_, _>>(),
-        ))
+                .map(|(id, value)| match value {
+                    Some(value) => SensorReading::new(*id, 1000).with_value(
+                        *value,
+                        id.title().into(),
+                        "test".into(),
+                        "/test".into(),
+                    ),
+                    None => SensorReading::new(*id, 1000),
+                })
+                .collect(),
+        }
+    }
+
+    fn cpu_only(temp: i32) -> Sensors {
+        sensors([
+            (SensorId::Cpu, Some(temp)),
+            (SensorId::Phy, None),
+            (SensorId::Wifi1, None),
+            (SensorId::Wifi2, None),
+            (SensorId::Module, None),
+        ])
+    }
+
+    fn no_sensors() -> Sensors {
+        sensors([
+            (SensorId::Cpu, None),
+            (SensorId::Phy, None),
+            (SensorId::Wifi1, None),
+            (SensorId::Wifi2, None),
+            (SensorId::Module, None),
+        ])
+    }
+
+    fn input<'a>(settings: &'a Settings, sensors: &'a Sensors) -> CycleInput<'a> {
+        CycleInput {
+            settings,
+            sensors,
+            floor: 0,
+            current_pwm: 0,
+            last_applied: None,
+            down_since: 0,
+            now: 1000,
+        }
+    }
+
+    fn decide_on(settings: &Settings, sensors: &Sensors) -> Decision {
+        decide(&input(settings, sensors))
     }
 
     #[test]
-    fn auto_mode_applies_curve_output() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-auto");
-        let paths = fixture(&tmp);
-        let cfg = cfg_with(&[]);
-        let mut vendor = NoVendor;
-        // 55°C on balanced curve is the 55:60 point: 60% -> 153.
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "153");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.result, "ok");
-        assert_eq!(state.reason, "auto");
-        assert_eq!(state.requested_pwm, Some(153));
-        assert_eq!(state.target_pwm, Some(153));
-        assert_eq!(state.applied_pwm, Some(153));
-        assert_eq!(state.control_temp, Some(55));
-        assert_eq!(state.thermal_owner, "shared");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn disabled_mode_never_moves_the_fan() {
+        let settings = cfg("\toption enabled '0'\n");
+        let sensors = cpu_only(90);
+        let mut input = input(&settings, &sensors);
+        input.current_pwm = 77;
+        let decision = decide(&input);
+        assert_eq!(decision.reason, Reason::Kernel);
+        assert_eq!(decision.target, 77, "the kernel keeps its own output");
+        assert_eq!(decision.requested, 0);
+        assert_eq!(decision.result, ControlResult::Ok);
     }
 
     #[test]
-    fn manual_mode_uses_configured_pwm() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-manual");
-        let paths = fixture(&tmp);
-        let cfg = cfg_with(&[("mode", "manual"), ("manual_pwm", "200")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "200");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.reason, "manual");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn kernel_mode_reports_the_observed_temperature() {
+        let settings = cfg("\toption mode 'kernel'\n");
+        let sensors = cpu_only(90);
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.reason, Reason::Kernel);
+        assert_eq!(decision.control_temp, Some(90));
+        assert_eq!(decision.target, 0);
     }
 
     #[test]
-    fn kernel_mode_leaves_output_untouched() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-kernel");
-        let paths = fixture(&tmp);
-        write(&pwm_file(&paths), "180\n");
-        let cfg = cfg_with(&[("mode", "kernel")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "180");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.reason, "kernel");
-        assert_eq!(state.thermal_owner, "kernel");
-        assert_eq!(state.requested_pwm, Some(0));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn manual_mode_uses_the_configured_output() {
+        let settings = cfg("\toption mode 'manual'\n\toption manual_pwm '100'\n");
+        let sensors = cpu_only(20);
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.requested, 100);
+        assert_eq!(decision.target, 100);
+        assert_eq!(decision.reason, Reason::Manual);
+        assert_eq!(decision.reason_text(), "manual");
     }
 
     #[test]
-    fn disabled_controller_switches_to_kernel_policies() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-disabled");
-        let paths = fixture(&tmp);
-        write(&pwm_file(&paths), "120\n");
-        let cfg = cfg_with(&[("enabled", "0")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "120");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.thermal_owner, "kernel");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn missing_sensor_forces_the_high_output_failsafe() {
+        let settings = cfg("");
+        let sensors = no_sensors();
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.reason, Reason::SensorFailsafe);
+        assert_eq!(decision.result, ControlResult::Failsafe);
+        assert_eq!(decision.requested, 255);
+        assert_eq!(decision.control_temp, None);
     }
 
     #[test]
-    fn missing_sensor_triggers_failsafe_full_output() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-nosensor");
-        let paths = fixture(&tmp);
-        std::fs::remove_file(tmp.join("sys/class/thermal/thermal_zone0/temp")).unwrap();
-        let cfg = cfg_with(&[("fail_pwm", "200")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        // The shared kernel cooling map cannot be evaluated without a CPU
-        // reading, so the safety floor escalates the 200 PWM to full speed.
-        assert_eq!(read_pwm(&paths), "255");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.result, "failsafe");
-        assert_eq!(state.reason, "sensor-failsafe+kernel-floor");
-        assert_eq!(state.requested_pwm, Some(200));
-        assert_eq!(state.control_temp, None);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn invalid_curve_forces_the_high_output_failsafe() {
+        let settings = cfg("\toption curve 'custom'\n\toption curve_custom '50:100,40:80'\n");
+        let sensors = cpu_only(60);
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.reason, Reason::CurveFailsafe);
+        assert_eq!(decision.requested, settings.fail_pwm);
+        assert_eq!(decision.result, ControlResult::Failsafe);
     }
 
     #[test]
-    fn invalid_curve_triggers_curve_failsafe() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-badcurve");
-        let paths = fixture(&tmp);
-        let cfg = cfg_with(&[("curve", "custom"), ("curve_custom", "40:50,30:60")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "255");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.result, "failsafe");
-        assert_eq!(state.reason, "curve-failsafe");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn automatic_mode_follows_the_curve_and_reports_the_reason() {
+        let settings = cfg("\toption curve 'balanced'\n");
+        let sensors = cpu_only(55);
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.reason, Reason::Auto);
+        assert_eq!(decision.requested, (60u16 * 255 / 100) as u8);
+        assert_eq!(decision.result, ControlResult::Ok);
+        assert_eq!(decision.control_temp, Some(55));
     }
 
     #[test]
-    fn kernel_floor_raises_low_curve_output() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-floor");
-        let paths = fixture(&tmp);
-        // 90°C: the kernel map at 83°C demands state 2 (PWM 160); the quiet
-        // test curve only reaches 28% (71), so the floor wins.
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "90000\n");
-        let cfg = cfg_with(&[("curve", "silent"), ("curve_silent", "20:0,50:20,95:30")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "160");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.reason, "auto+kernel-floor");
-        assert_eq!(state.target_pwm, Some(160));
-        assert_eq!(state.requested_pwm, Some(71));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn kernel_floor_raises_the_target_and_is_labelled() {
+        let settings = cfg("\toption curve 'balanced'\n");
+        let sensors = cpu_only(45);
+        let mut input = input(&settings, &sensors);
+        input.floor = 200;
+        let decision = decide(&input);
+        let curve = settings.active_curve().unwrap();
+        assert_eq!(
+            decision.requested,
+            curve::pwm_for(&curve, 45).unwrap(),
+            "the request stays what the curve asked for"
+        );
+        assert_eq!(decision.target, 200);
+        assert!(decision.kernel_floor_applied);
+        assert_eq!(decision.reason_text(), "auto+kernel-floor");
     }
 
     #[test]
-    fn down_delay_holds_previous_output() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-down-delay");
-        let paths = fixture(&tmp);
-        // First cycle at 60°C: 60 + 5*15/15 = 65% -> 165.
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "60000\n");
-        let cfg = cfg_with(&[("down_delay", "30"), ("hysteresis", "2")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "165");
-        // Temperature drops to 45°C (hysteresis candidate 47°C -> 54% -> 137),
-        // but the 30 s delay holds the previous output.
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "45000\n");
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1010, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "165");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.reason, "auto-down-delay");
-        // The countdown starts when the first reduction is attempted.
-        assert_eq!(state.down_since, Some(1010));
-        // After the delay elapses the hysteresis-adjusted candidate applies:
-        // 47°C -> 54% -> 137 (a further cycle would settle at the 45°C value).
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1041, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "137");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.reason, "auto");
-        assert_eq!(state.down_since, Some(0));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn manual_requests_are_still_bounded_by_the_kernel_floor() {
+        let settings = cfg("\toption mode 'manual'\n\toption manual_pwm '10'\n");
+        let sensors = cpu_only(90);
+        let mut input = input(&settings, &sensors);
+        input.floor = 180;
+        let decision = decide(&input);
+        assert_eq!(decision.target, 180);
+        assert!(decision.kernel_floor_applied);
+        assert_eq!(decision.reason_text(), "manual+kernel-floor");
     }
 
     #[test]
-    fn speed_increases_apply_immediately() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-up");
-        let paths = fixture(&tmp);
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "45000\n");
-        let cfg = cfg_with(&[]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "135");
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "70000\n");
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1001, &NO_SLEEP)
-            .unwrap();
-        // 70°C is a curve point: 75% -> 191 immediately, no delay.
-        assert_eq!(read_pwm(&paths), "191");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn spin_down_is_delayed_and_holds_the_previous_output() {
+        let settings = cfg("\toption down_delay '30'\n\toption hysteresis '2'\n");
+        let sensors = cpu_only(40);
+        let mut input = input(&settings, &sensors);
+        input.current_pwm = 200;
+        input.last_applied = Some(200);
+        let decision = decide(&input);
+        assert_eq!(decision.reason, Reason::AutoDownDelay);
+        assert_eq!(decision.target, 200, "the fan must not slow down yet");
+        assert_eq!(decision.down_since, 1000, "the delay clock starts now");
+        assert!(decision.holding_previous);
+
+        input.down_since = 970;
+        let decision = decide(&input);
+        assert_eq!(decision.reason, Reason::Auto);
+        assert_eq!(decision.down_since, 0);
+        assert!(decision.target < 200);
     }
 
     #[test]
-    fn start_boost_kicks_stopped_fan_then_settles() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-boost");
-        let paths = fixture(&tmp);
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "55000\n");
-        let cfg = cfg_with(&[("start_pwm", "220"), ("start_boost_ms", "700")]);
-        let mut vendor = NoVendor;
-        let boosts = std::cell::RefCell::new(Vec::new());
-        let sleep = |secs: u64| {
-            boosts.borrow_mut().push(secs);
-        };
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &sleep)
-            .unwrap();
-        // 700 ms rounds up to one whole second of boost.
-        assert_eq!(boosts.borrow().as_slice(), &[1u64]);
-        // The boost wrote max(220, 153) = 220 first, then the target 153.
-        assert_eq!(read_pwm(&paths), "153");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn spin_up_is_immediate_even_while_a_delay_is_running() {
+        let settings = cfg("\toption down_delay '300'\n");
+        let sensors = cpu_only(88);
+        let mut input = input(&settings, &sensors);
+        input.current_pwm = 100;
+        input.last_applied = Some(100);
+        input.down_since = 900;
+        let decision = decide(&input);
+        assert_eq!(decision.reason, Reason::Auto);
+        assert!(decision.target > 100);
+        assert_eq!(decision.down_since, 0);
     }
 
     #[test]
-    fn missing_pwm_node_reports_error_state() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-nopwm");
-        let paths = fixture(&tmp);
-        std::fs::remove_file(pwm_file(&paths)).unwrap();
-        let cfg = cfg_with(&[]);
-        let mut vendor = NoVendor;
-        let err = controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap_err();
-        assert!(err.contains("PWM control node not found"));
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.result, "error");
-        assert_eq!(state.reason, "pwm-not-found");
-        assert!(state.last_error.contains("PWM control node not found"));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn hysteresis_only_ever_raises_the_slow_down_target() {
+        let cold = cfg("\toption hysteresis '0'\n\toption down_delay '5'\n");
+        let warm = cfg("\toption hysteresis '10'\n\toption down_delay '5'\n");
+        let sensors = cpu_only(60);
+
+        let mut base = input(&cold, &sensors);
+        base.current_pwm = 255;
+        base.last_applied = Some(255);
+        // The delay already expired, so the curve decides - with the CPU reading
+        // lifted by the hysteresis.
+        base.down_since = 900;
+        let plain = decide(&base);
+
+        let mut warm_input = input(&warm, &sensors);
+        warm_input.current_pwm = 255;
+        warm_input.last_applied = Some(255);
+        warm_input.down_since = 900;
+        let with_hysteresis = decide(&warm_input);
+
+        assert_eq!(plain.reason, Reason::Auto);
+        assert_eq!(with_hysteresis.reason, Reason::Auto);
+        assert!(
+            with_hysteresis.target > plain.target,
+            "hysteresis must never cool less: {} < {}",
+            with_hysteresis.target,
+            plain.target
+        );
     }
 
     #[test]
-    fn exclusive_ownership_uses_emergency_floors() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-exclusive");
-        let paths = fixture(&tmp);
-        // Detach the fan from the kernel cooling map (patch applied).
-        let map = tmp.join("dt/thermal-zones/cpu-thermal/cooling-maps/map0/cooling-device");
-        write_be32(&map, &[0x99, 2]);
-        write(&tmp.join("sys/class/thermal/thermal_zone0/temp"), "90000\n");
-        let cfg = cfg_with(&[("curve", "silent"), ("curve_silent", "20:0,95:100")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        // 90°C on the quiet curve: 0 + 70*100/75 = 93% -> 237; the userspace
-        // emergency floor at 83°C only demands 160, so the curve stays in charge.
-        assert_eq!(read_pwm(&paths), "237");
-        let state = ControllerState::read(&paths.state_file());
-        // Exclusive ownership was derived from the cooling maps, so the owner
-        // stays "userspace" (the "userspace-pwm" tag only appears when no
-        // pwm-fan cooling device exists at all).
-        assert_eq!(state.thermal_owner, "userspace");
-        // Missing CPU sensor under exclusive ownership -> full speed.
-        std::fs::remove_file(tmp.join("sys/class/thermal/thermal_zone0/temp")).unwrap();
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1001, &NO_SLEEP)
-            .unwrap();
-        assert_eq!(read_pwm(&paths), "255");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn failsafe_output_is_not_subject_to_the_spin_down_delay() {
+        let settings = cfg("\toption down_delay '300'\n\toption fail_pwm '255'\n");
+        let sensors = no_sensors();
+        let mut input = input(&settings, &sensors);
+        input.current_pwm = 20;
+        input.last_applied = Some(20);
+        let decision = decide(&input);
+        assert_eq!(decision.reason, Reason::SensorFailsafe);
+        assert_eq!(decision.target, 255);
+        assert_eq!(decision.down_since, 0);
     }
 
     #[test]
-    fn custom_profile_selection_respects_curve() {
-        let tmp = std::env::temp_dir().join("h5fan-apply-custom");
-        let paths = fixture(&tmp);
-        let cfg = cfg_with(&[("curve", "custom"), ("curve_custom", "20:0,55:100")]);
-        let mut vendor = NoVendor;
-        controller(&paths)
-            .apply_once(&cfg, &mut vendor, 1000, &NO_SLEEP)
-            .unwrap();
-        // 55°C at 100% -> 255.
-        assert_eq!(read_pwm(&paths), "255");
-        let state = ControllerState::read(&paths.state_file());
-        assert_eq!(state.result, "ok");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn control_temperature_uses_the_hottest_valid_sensor() {
+        let settings = cfg("");
+        let sensors = sensors([
+            (SensorId::Cpu, Some(52)),
+            (SensorId::Phy, Some(61)),
+            (SensorId::Wifi1, Some(58)),
+            (SensorId::Wifi2, Some(49)),
+            (SensorId::Module, Some(40)),
+        ]);
+        let decision = decide_on(&settings, &sensors);
+        let curve = settings.active_curve().unwrap();
+        assert_eq!(decision.requested, curve::pwm_for(&curve, 61).unwrap());
+        assert_eq!(decision.control_temp, Some(61));
+    }
+
+    #[test]
+    fn stale_and_invalid_sensors_cannot_be_control_inputs() {
+        let settings = cfg("");
+        let mut sensors = cpu_only(70);
+        sensors.readings[0].state = crate::sensor::SensorState::Stale;
+        sensors.readings[0].value_c = None;
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.reason, Reason::SensorFailsafe);
+    }
+
+    #[test]
+    fn control_source_is_carried_into_the_decision() {
+        let settings = cfg("");
+        let sensors = cpu_only(70);
+        let decision = decide_on(&settings, &sensors);
+        assert_eq!(decision.control_source.as_deref(), Some("test"));
+        assert_eq!(decision.control_sensor.as_deref(), Some("CPU"));
     }
 }

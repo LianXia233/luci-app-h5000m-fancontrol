@@ -1,11 +1,10 @@
 # Rust build wrapper invoked by the OpenWrt / LuCI package build.
 #
-# luci.mk detects this Makefile and (a) marks the package as
-# architecture-specific instead of `all`, (b) runs `make -C src clean
-# compile` inside PKG_BUILD_DIR and `make -C src install` with
-# DESTDIR=$(PKG_INSTALL_DIR). The controller itself is a dependency-free
-# Rust crate that links fully static against musl, so building it needs
-# nothing but a Rust toolchain (rustup) with the right target installed.
+# luci.mk detects this Makefile and (a) marks the package architecture-specific
+# instead of `all`, (b) runs `make -C src clean compile` inside PKG_BUILD_DIR
+# and `make -C src install` with DESTDIR=$(PKG_INSTALL_DIR). The controller is a
+# dependency-free Rust crate that links fully static against musl, so building
+# it needs nothing but a Rust toolchain (rustup) with the right target added.
 
 RUST_TARGET_aarch64 := aarch64-unknown-linux-musl
 RUST_TARGET_arm     := armv7-unknown-linux-musleabihf
@@ -23,11 +22,10 @@ ifeq ($(CARGO),)
 $(error h5000m-fancontrol: cargo not found in PATH - install a Rust toolchain, e.g. via https://rustup.rs)
 endif
 
-# luci.mk invokes this Makefile as a plain sub-make with DESTDIR and the
-# toolchain variables only - the OpenWrt install helpers are not defined in
-# that context. Fall back to the canonical OpenWrt definitions when missing,
-# otherwise $(INSTALL_DIR) expands to nothing and install tries to execute
-# the DESTDIR path as a command (error 127).
+# luci.mk calls this Makefile as a plain sub-make with DESTDIR and the toolchain
+# variables only; the OpenWrt install helpers are not defined in that context.
+# Fall back to the canonical definitions, otherwise $(INSTALL_DIR) expands to
+# nothing and install tries to execute the DESTDIR path (error 127).
 ifeq ($(strip $(INSTALL_DIR)),)
 INSTALL_DIR := install -d
 endif
@@ -35,8 +33,8 @@ ifeq ($(strip $(INSTALL_BIN)),)
 INSTALL_BIN := install -m0755
 endif
 
-# Expected ELF machine description per target, used to prove the binary was
-# really cross-compiled for the router instead of picking up a host build.
+# Expected ELF machine description per target, used to prove the binary really
+# was cross-compiled for the router instead of picking up a host build.
 FILE_MACHINE_aarch64-unknown-linux-musl     := aarch64
 FILE_MACHINE_armv7-unknown-linux-musleabihf := ARM
 FILE_MACHINE_x86_64-unknown-linux-musl      := x86-64
@@ -45,8 +43,8 @@ FILE_MACHINE_i686-unknown-linux-musl        := 80386
 # cargo --target places the binary under target/<triple>/release/.
 BINARY := target/$(RUST_TARGET)/release/h5000m-fancontrol
 
-# The crate has no dependencies and ships Cargo.lock, so an offline build is
-# fully reproducible and never touches the network.
+# No dependencies plus a committed Cargo.lock: an offline build is reproducible
+# and never touches the network from inside the SDK.
 CARGO_FLAGS := --release --offline --target $(RUST_TARGET)
 
 all: compile

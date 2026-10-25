@@ -3,8 +3,9 @@ name = "h5000m-fancontrol"
 version = "3.0.0"
 edition = "2021"
 rust-version = "1.74"
-description = "Hiveton H5000M fan controller with thermal safety floors"
 license = "Apache-2.0"
+description = "Hiveton H5000M native fan controller with kernel safety floors"
+publish = false
 
 [lib]
 name = "h5000m_fancontrol"
@@ -14,13 +15,18 @@ path = "src/lib.rs"
 name = "h5000m-fancontrol"
 path = "src/main.rs"
 
-# Intentionally dependency-free: the controller runs as a long-lived daemon on
-# a router and must stay small, auditable and easy to cross-compile with musl.
+# Intentionally dependency free: the controller runs as a long lived daemon on a
+# router, before optional tooling is available, and must stay small, auditable
+# and easy to cross compile against musl.
 [dependencies]
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
+debug = false
+
+[profile.test]
+opt-level = 0

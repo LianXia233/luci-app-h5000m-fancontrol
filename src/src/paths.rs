@@ -1,68 +1,91 @@
-//! Filesystem layout of the controller.
+//! Filesystem roots used by the controller.
 //!
-//! The production defaults match the historical shell controller exactly. The
-//! environment overrides exist so tests and diagnostics can point every sysfs
-//! lookup at an isolated fake tree instead of real hardware.
+//! Every hardware facing path is resolved through [`Paths`] instead of a string
+//! literal so that the whole control loop can run against a simulated sysfs
+//! tree in tests. The environment variable names keep the ones the 2.x shell
+//! controller already exposed.
 
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+/// Directory entry names such as `hwmon10` sort lexicographically before
+/// `hwmon2`, which would change which sensor wins when several candidates
+/// exist. Sorting by the embedded index keeps discovery stable.
+pub fn sort_by_trailing_index(paths: &mut [PathBuf]) {
+    paths.sort_by(|a, b| {
+        let key = |p: &Path| -> (u128, String) {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let digits: String = name
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let index = digits.parse::<u128>().unwrap_or(u128::MAX);
+            (index, name)
+        };
+        key(a).cmp(&key(b))
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
-    /// Root for temperature sensor lookups (`/sys/class/thermal`,
-    /// `/sys/class/hwmon`). Override: `H5000M_FAN_SENSOR_SYSFS_ROOT`.
-    pub sensor_root: PathBuf,
-    /// Root for PWM discovery, RPM inputs, cooling devices and thermal policy
-    /// inspection. Override: `H5000M_FAN_PWM_SYSFS_ROOT`.
-    pub pwm_root: PathBuf,
-    /// Network interface directory used for vendor radio probing.
-    /// Override: `H5000M_FAN_RADIO_SYSFS_ROOT`.
-    pub radio_root: PathBuf,
-    /// Device-tree base directory for cooling-map analysis.
-    /// Override: `H5000M_FAN_DT_ROOT`.
-    pub dt_root: PathBuf,
-    /// Runtime directory holding the state file and daemon snapshot.
-    /// Override: `H5000M_FAN_STATE_DIR`.
-    pub state_dir: PathBuf,
-    /// Lock directory guarding concurrent control decisions.
-    /// Override: `H5000M_FAN_LOCK_DIR`.
+    /// Root of `/sys`; thermal zones and hwmon devices are resolved below it.
+    pub sysfs: PathBuf,
+    /// Root holding network interfaces, used to check radio interfaces exist.
+    pub radio: PathBuf,
+    /// `/sys/firmware/devicetree/base` equivalent.
+    pub dt: PathBuf,
+    /// UCI configuration file for the package.
+    pub uci_config: PathBuf,
+    /// Directory for the state snapshot, legacy policy record and wake marker.
+    pub run_dir: PathBuf,
+    /// Exclusive control lock directory.
     pub lock_dir: PathBuf,
-    /// MT5700M manager temperature cache. Override:
-    /// `H5000M_FAN_MT5700M_TEMP_CACHE`.
+    /// `/proc` equivalent, used only for liveness checks.
+    pub proc_root: PathBuf,
+    /// MT5700M manager temperature cache.
     pub module_cache: PathBuf,
-    /// Maximum age (seconds) of the module cache before it counts as stale.
-    /// Override: `H5000M_FAN_MT5700M_TEMP_MAX_AGE`.
+    /// Maximum accepted age of the module cache, in seconds.
     pub module_cache_max_age: u64,
-    /// Directory scanned for legacy QModem cache files (`cache_base_info_*`,
-    /// `cache_*info*`). Override: `H5000M_FAN_LEGACY_CACHE_DIR`.
+    /// Directory scanned for the legacy QModem style cache files.
     pub legacy_cache_dir: PathBuf,
+    /// Log socket used for syslog (`/dev/log`).
+    pub syslog_socket: PathBuf,
 }
 
-fn env_path(name: &str, default: &str) -> PathBuf {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(default))
+fn from_env(key: &str, default: &str) -> PathBuf {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => PathBuf::from(default),
+    }
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
+fn uint_from_env(key: &str, default: u64) -> u64 {
+    std::env::var(key)
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default)
 }
 
 impl Default for Paths {
     fn default() -> Self {
         Paths {
-            sensor_root: PathBuf::from("/sys"),
-            pwm_root: PathBuf::from("/sys"),
-            radio_root: PathBuf::from("/sys/class/net"),
-            dt_root: PathBuf::from("/sys/firmware/devicetree/base"),
-            state_dir: PathBuf::from("/var/run"),
+            sysfs: PathBuf::from("/sys"),
+            radio: PathBuf::from("/sys/class/net"),
+            dt: PathBuf::from("/sys/firmware/devicetree/base"),
+            uci_config: PathBuf::from("/etc/config/h5000m_fancontrol"),
+            run_dir: PathBuf::from("/var/run"),
             lock_dir: PathBuf::from("/var/lock/h5000m-fancontrol.lock"),
+            proc_root: PathBuf::from("/proc"),
             module_cache: PathBuf::from("/var/run/mt5700m/temperature"),
             module_cache_max_age: 60,
             legacy_cache_dir: PathBuf::from("/tmp"),
+            syslog_socket: PathBuf::from("/dev/log"),
         }
     }
 }
@@ -70,72 +93,120 @@ impl Default for Paths {
 impl Paths {
     pub fn from_env() -> Self {
         Paths {
-            sensor_root: env_path("H5000M_FAN_SENSOR_SYSFS_ROOT", "/sys"),
-            pwm_root: env_path("H5000M_FAN_PWM_SYSFS_ROOT", "/sys"),
-            radio_root: env_path("H5000M_FAN_RADIO_SYSFS_ROOT", "/sys/class/net"),
-            dt_root: env_path("H5000M_FAN_DT_ROOT", "/sys/firmware/devicetree/base"),
-            state_dir: env_path("H5000M_FAN_STATE_DIR", "/var/run"),
-            lock_dir: env_path("H5000M_FAN_LOCK_DIR", "/var/lock/h5000m-fancontrol.lock"),
-            module_cache: env_path(
+            sysfs: from_env("H5000M_FAN_SENSOR_SYSFS_ROOT", "/sys"),
+            radio: from_env("H5000M_FAN_RADIO_SYSFS_ROOT", "/sys/class/net"),
+            dt: from_env("H5000M_FAN_DT_ROOT", "/sys/firmware/devicetree/base"),
+            uci_config: from_env("H5000M_FAN_UCI_CONFIG", "/etc/config/h5000m_fancontrol"),
+            run_dir: from_env("H5000M_FAN_RUN_DIR", "/var/run"),
+            lock_dir: from_env("H5000M_FAN_LOCK_DIR", "/var/lock/h5000m-fancontrol.lock"),
+            proc_root: from_env("H5000M_FAN_PROC_ROOT", "/proc"),
+            module_cache: from_env(
                 "H5000M_FAN_MT5700M_TEMP_CACHE",
                 "/var/run/mt5700m/temperature",
             ),
-            module_cache_max_age: env_u64("H5000M_FAN_MT5700M_TEMP_MAX_AGE", 60),
-            legacy_cache_dir: env_path("H5000M_FAN_LEGACY_CACHE_DIR", "/tmp"),
+            module_cache_max_age: uint_from_env("H5000M_FAN_MT5700M_TEMP_MAX_AGE", 60),
+            legacy_cache_dir: from_env("H5000M_FAN_LEGACY_CACHE_DIR", "/tmp"),
+            syslog_socket: from_env("H5000M_FAN_SYSLOG_SOCKET", "/dev/log"),
         }
     }
 
+    /// Everything the controller reads lives under a single directory.
+    /// Used by the regression tests; never points at real hardware.
+    pub fn sandbox(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        Paths {
+            sysfs: root.join("sys"),
+            radio: root.join("sys/class/net"),
+            dt: root.join("sys/firmware/devicetree/base"),
+            uci_config: root.join("etc/config/h5000m_fancontrol"),
+            run_dir: root.join("var/run"),
+            lock_dir: root.join("var/lock/h5000m-fancontrol.lock"),
+            proc_root: root.join("proc"),
+            module_cache: root.join("var/run/mt5700m/temperature"),
+            module_cache_max_age: 60,
+            legacy_cache_dir: root.join("tmp"),
+            syslog_socket: root.join("dev/log"),
+        }
+    }
+
+    pub fn thermal_dir(&self) -> PathBuf {
+        self.sysfs.join("class/thermal")
+    }
+
+    pub fn hwmon_dir(&self) -> PathBuf {
+        self.sysfs.join("class/hwmon")
+    }
+
     pub fn state_file(&self) -> PathBuf {
-        self.state_dir.join("h5000m-fancontrol.state")
+        self.run_dir.join("h5000m-fancontrol.state")
     }
 
-    pub fn policy_file(&self) -> PathBuf {
-        self.state_dir.join("h5000m-fancontrol.policy")
+    /// Written by the 2.0.x shell controller when it switched a thermal zone to
+    /// `user_space`. Only ever read to undo that, never created by 3.x.
+    pub fn legacy_policy_file(&self) -> PathBuf {
+        self.run_dir.join("h5000m-fancontrol.policy")
     }
 
-    pub fn snapshot_file(&self) -> PathBuf {
-        self.state_dir.join("h5000m-fancontrol.snapshot.json")
+    pub fn wake_file(&self) -> PathBuf {
+        self.run_dir.join("h5000m-fancontrol.wake")
+    }
+
+    pub fn event_log(&self) -> PathBuf {
+        self.run_dir.join("h5000m-fancontrol.events")
+    }
+
+    pub fn cooling_map_root(&self) -> PathBuf {
+        self.dt.join("thermal-zones")
+    }
+
+    pub fn pwm_fan_dt(&self) -> PathBuf {
+        self.dt.join("pwm-fan")
     }
 }
 
-/// Glob-free, sorted directory listing matching `prefix` + word characters,
-/// mirroring POSIX shell glob expansion order (lexicographic by file name).
-pub fn sorted_glob(dir: &Path, prefix: &str) -> Vec<PathBuf> {
-    let mut names: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| {
-                        n.len() > prefix.len()
-                            && n.starts_with(prefix)
-                            && n[prefix.len()..].bytes().all(|b| b.is_ascii_digit())
-                    })
-                    .unwrap_or(false)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    names.sort();
-    names
+/// Read a small file, trimming the trailing newline sysfs adds.
+/// Returns `None` for unreadable files *and* for empty content so that callers
+/// can treat both as "no reading" rather than as a zero value.
+pub fn read_trimmed(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = raw.trim_matches(|c| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
 }
 
-/// All direct children of `dir`, sorted by file name (shell glob order).
-pub fn sorted_children(dir: &Path) -> Vec<PathBuf> {
-    let mut names: Vec<PathBuf> = match std::fs::read_dir(dir) {
-        Ok(entries) => entries.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-        Err(_) => Vec::new(),
-    };
-    names.sort();
-    names
+/// List directories whose name starts with `prefix`, naturally sorted.
+pub fn list_dirs(parent: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            if entry.path().is_dir() {
+                out.push(entry.path());
+            }
+        }
+    }
+    sort_by_trailing_index(&mut out);
+    out
 }
 
-pub fn read_trim(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+/// List files whose name starts with `prefix`, naturally sorted.
+pub fn list_files(parent: &Path, prefix: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(prefix) && entry.path().is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    sort_by_trailing_index(&mut out);
+    out
 }
 
 #[cfg(test)]
@@ -143,22 +214,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sorted_glob_matches_shell_order() {
-        let tmp = std::env::temp_dir().join("h5fan-glob-test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("thermal_zone2")).unwrap();
-        std::fs::create_dir_all(tmp.join("thermal_zone10")).unwrap();
-        std::fs::create_dir_all(tmp.join("thermal_zone1")).unwrap();
-        std::fs::create_dir_all(tmp.join("other")).unwrap();
-        let names: Vec<String> = sorted_glob(&tmp, "thermal_zone")
-            .iter()
-            .filter_map(|p| p.file_name().unwrap().to_str().map(String::from))
-            .collect();
-        // Shell glob order is plain lexicographic: 1, 10, 2.
+    fn trailing_index_sort_is_numeric() {
+        let mut paths = vec![
+            PathBuf::from("/x/hwmon10"),
+            PathBuf::from("/x/hwmon2"),
+            PathBuf::from("/x/hwmon1"),
+            PathBuf::from("/x/hwmon"),
+        ];
+        sort_by_trailing_index(&mut paths);
         assert_eq!(
-            names,
-            vec!["thermal_zone1", "thermal_zone10", "thermal_zone2"]
+            paths,
+            vec![
+                // A name without a trailing index sorts last: it is not a
+                // numbered device and must not outrank one.
+                PathBuf::from("/x/hwmon1"),
+                PathBuf::from("/x/hwmon2"),
+                PathBuf::from("/x/hwmon10"),
+                PathBuf::from("/x/hwmon"),
+            ]
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sandbox_paths_do_not_touch_real_sysfs() {
+        let paths = Paths::sandbox("/tmp/does-not-exist");
+        assert!(!paths.sysfs.starts_with("/sys"));
+        assert!(!paths
+            .lock_dir
+            .starts_with("/var/lock/h5000m-fancontrol.lock"));
     }
 }

@@ -1,385 +1,671 @@
-//! Kernel cooling-map analysis and the PWM safety floor.
+//! Kernel thermal state: who owns the fan, and what minimum cooling the kernel
+//! still demands.
 //!
-//! The kernel thermal governor may also drive the same PWM output through
-//! `cooling-device` references in the device tree. Direct PWM writes change
-//! `cur_state`, so the current cooling state alone is not a safe floor.
-//! Instead, this module derives the minimum required cooling state from the
-//! kernel's own cooling maps and translates it into a PWM floor that the
-//! controller never undercuts. When the fan has no cooling maps (firmware
-//! built with the exclusive-fan patch), conservative high-temperature floors
-//! keep emergency cooling available.
+//! Two invariants drive this module.
+//!
+//! 1. The controller only writes PWM. It never switches a CPU thermal zone to
+//!    `user_space`, because that would detach the kernel's CPU throttling and
+//!    hot/critical protection. The only policy write left is undoing what the
+//!    2.0.x releases did (see [`restore_legacy_policy`]).
+//! 2. When the kernel still drives the fan through a cooling map, the effective
+//!    output can never be below what that map demands. `cur_state` is not used
+//!    as the floor, because a direct PWM write changes `cur_state` too; the
+//!    requirement is derived from the devicetree cooling maps instead.
 
-use crate::paths::{read_trim, sorted_children, sorted_glob, Paths};
+use crate::fan::{self, FanDevice};
+use crate::paths::{list_dirs, read_trimmed, Paths};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ThermalOwner {
-    /// No cooling device for the fan was found.
-    Unknown,
-    /// The kernel has cooling maps referencing the fan.
+/// `pwm-fan` output levels are 8 bit on this board.
+pub const PWM_LIMIT: u32 = 255;
+/// Emergency map states of the stock H5000M device tree: 83 C raises the fan a
+/// step, 113 C is the last state. These are the kernel's own trip points, not a
+/// project invention, and the shell controller used the same numbers.
+pub const EMERGENCY_STATE_2_C: i32 = 83;
+pub const EMERGENCY_STATE_3_C: i32 = 113;
+/// Conservative first active trip used when devicetree discovery fails on older
+/// firmware that mapped 38 C to state 1.
+pub const FALLBACK_STATE_1_C: i32 = 38;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// The fan is referenced by at least one cooling map, so the kernel and the
+    /// controller both move the PWM output.
     Shared,
-    /// No cooling map references the fan; userspace owns the fan policy.
-    Userspace,
-    /// The controller is disabled / kernel-only mode.
+    /// Cooling maps exist but none reference the fan (the shipped
+    /// `openwrt-patches` case): the controller owns the fan policy alone.
+    Exclusive,
+    /// The controller is disabled or in kernel-only mode.
     Kernel,
-    /// Userspace owns the PWM output while the kernel governor stays intact.
-    UserspacePwm,
+    /// Nothing could be determined; treated as controller owned.
+    Unknown,
 }
 
-impl ThermalOwner {
-    pub fn as_str(&self) -> &'static str {
+impl Ownership {
+    pub fn as_str(self) -> &'static str {
         match self {
-            ThermalOwner::Unknown => "unknown",
-            ThermalOwner::Shared => "shared",
-            ThermalOwner::Userspace => "userspace",
-            ThermalOwner::Kernel => "kernel",
-            ThermalOwner::UserspacePwm => "userspace-pwm",
+            Ownership::Shared => "shared",
+            Ownership::Exclusive => "userspace",
+            Ownership::Kernel => "kernel",
+            Ownership::Unknown => "unknown",
         }
+    }
+
+    /// Value the 2.x controller published while applying a policy.
+    pub fn as_apply_str(self) -> &'static str {
+        match self {
+            Ownership::Unknown => "userspace-pwm",
+            other => other.as_str(),
+        }
+    }
+
+    pub fn parse(raw: &str) -> Ownership {
+        match raw {
+            "shared" => Ownership::Shared,
+            "userspace" | "userspace-pwm" => Ownership::Exclusive,
+            "kernel" => Ownership::Kernel,
+            _ => Ownership::Unknown,
+        }
+    }
+
+    pub fn describes_kernel_protection_active(self) -> bool {
+        matches!(self, Ownership::Shared | Ownership::Kernel)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ThermalFloor {
-    pub floor: u32,
-    pub state: u32,
-    pub max_state: u32,
-    pub owner: ThermalOwner,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trip {
+    pub zone: String,
+    pub name: String,
+    pub kind: String,
+    pub temp_c: Option<i32>,
+    pub hysteresis_c: u32,
 }
 
-impl Default for ThermalFloor {
-    fn default() -> Self {
-        ThermalFloor {
-            floor: 0,
-            state: 0,
-            max_state: 0,
-            owner: ThermalOwner::Unknown,
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuZone {
+    pub path: PathBuf,
+    pub kind: String,
+    pub policy: Option<String>,
+    pub available_policies: Vec<String>,
+}
+
+impl CpuZone {
+    /// A `user_space` governor on the CPU zone means the kernel stopped managing
+    /// it, which the controller must never cause and should surface loudly.
+    pub fn governor_is_hijacked(&self) -> bool {
+        self.policy.as_deref() == Some("user_space")
     }
 }
 
-/// Reads the `index`-th big-endian u32 word of a binary device-tree property.
-pub fn read_be32(path: &Path, index: usize) -> Option<u32> {
+/// Everything the diagnostics need about kernel side protection.
+///
+/// Linux does not expose trip points under `thermal_zoneN`, so they are read
+/// from the devicetree where the firmware actually declares them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelProtection {
+    pub zone: Option<CpuZone>,
+    pub trips: Vec<Trip>,
+    pub cpufreq_cooling: bool,
+    pub fan_cooling_device: Option<String>,
+    pub fan_max_state: u32,
+    pub warnings: Vec<String>,
+}
+
+impl KernelProtection {
+    pub fn critical_trip(&self) -> Option<&Trip> {
+        self.trips.iter().find(|trip| trip.kind == "critical")
+    }
+
+    pub fn hot_trip(&self) -> Option<&Trip> {
+        self.trips.iter().find(|trip| trip.kind == "hot")
+    }
+
+    pub fn passive_trip(&self) -> Option<&Trip> {
+        self.trips.iter().find(|trip| trip.kind == "passive")
+    }
+
+    /// True when CPU throttling and at least one high temperature trip survive.
+    pub fn protections_intact(&self) -> bool {
+        let Some(zone) = self.zone.as_ref() else {
+            return false;
+        };
+        !zone.governor_is_hijacked()
+            && (self.critical_trip().is_some() || self.hot_trip().is_some())
+    }
+}
+
+/// Read one big-endian u32 out of a devicetree property at 4-byte `index`.
+pub fn dt_be32(path: &Path, index: usize) -> Option<u32> {
     let bytes = std::fs::read(path).ok()?;
-    let start = index.checked_mul(4)?;
-    let end = start.checked_add(4)?;
-    if end > bytes.len() {
+    let offset = index.checked_mul(4)?;
+    if bytes.len() < offset + 4 {
         return None;
     }
+    let window = &bytes[offset..offset + 4];
     Some(u32::from_be_bytes([
-        bytes[start],
-        bytes[start + 1],
-        bytes[start + 2],
-        bytes[start + 3],
+        window[0], window[1], window[2], window[3],
     ]))
 }
 
-/// First `cooling_device*` of type `pwm-fan`.
-fn cooling_device_path(pwm_root: &Path) -> Option<PathBuf> {
-    sorted_glob(&pwm_root.join("class/thermal"), "cooling_device")
-        .into_iter()
-        .find(|dev| read_trim(&dev.join("type")).unwrap_or_default() == "pwm-fan")
+/// Locate the CPU thermal zone for inspection.
+///
+/// Preference follows the shell rule (a zone whose type mentions cpu, soc or
+/// mt798), but the `user_space` requirement is dropped: reading a policy does
+/// not need the zone to be switchable, and insisting on it would hide the
+/// governor state on firmware where only `step_wise` is offered.
+pub fn find_cpu_zone(paths: &Paths) -> Option<CpuZone> {
+    let mut fallback: Option<CpuZone> = None;
+    for zone in list_dirs(&paths.thermal_dir(), "thermal_zone") {
+        let policy_path = zone.join("policy");
+        let available_path = zone.join("available_policies");
+        if !policy_path.exists() {
+            continue;
+        }
+        let kind = read_trimmed(&zone.join("type")).unwrap_or_else(|| "unknown".to_string());
+        let policy = read_trimmed(&policy_path);
+        let available_policies: Vec<String> = read_trimmed(&available_path)
+            .map(|text| {
+                text.split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        let candidate = CpuZone {
+            path: zone.clone(),
+            kind: kind.clone(),
+            policy,
+            available_policies,
+        };
+        let lowered = kind.to_lowercase();
+        if lowered.contains("cpu") || lowered.contains("soc") || lowered.contains("mt798") {
+            return Some(candidate);
+        }
+        if fallback.is_none() {
+            fallback = Some(candidate);
+        }
+    }
+    fallback
 }
 
-/// PWM value of a cooling level from the `cooling-levels` DT property. The
-/// property next to the PWM hwmon device takes precedence, then the standard
-/// `pwm-fan` node.
-fn cooling_level_for_state(pwm_path: &Path, dt_root: &Path, state: u32) -> Option<u32> {
-    let hwmon_dir = pwm_path.parent()?;
-    let mut levels = hwmon_dir
-        .join("device/of_node/cooling-levels")
-        .canonicalize()
-        .ok();
-    if !levels.as_ref().is_some_and(|p| p.is_file()) {
-        levels = None;
+/// All trips of every zone, used to resolve a cooling map trip phandle and to
+/// report which protections the firmware still declares.
+fn all_trips(paths: &Paths) -> Vec<(PathBuf, Trip)> {
+    let mut out = Vec::new();
+    for zone in list_dirs(&paths.cooling_map_root(), "") {
+        for trip in list_dirs(&zone.join("trips"), "trip-point") {
+            let name = read_trimmed(&trip.join("name"))
+                .or_else(|| {
+                    trip.file_name()
+                        .map(|value| value.to_string_lossy().to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let kind = read_trimmed(&trip.join("type")).unwrap_or_else(|| "unknown".to_string());
+            let temp_millic = dt_be32(&trip.join("temperature"), 0);
+            let temp_c = temp_millic.map(|value| (value / 1000) as i32);
+            let hysteresis_c = dt_be32(&trip.join("hysteresis"), 0)
+                .map(|value| value / 1000)
+                .unwrap_or(0);
+            let zone_name = zone
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push((
+                trip,
+                Trip {
+                    zone: zone_name,
+                    name,
+                    kind,
+                    temp_c,
+                    hysteresis_c,
+                },
+            ));
+        }
     }
-    let levels = match levels {
-        Some(path) => path,
-        None => {
-            let fallback = dt_root.join("pwm-fan/cooling-levels");
-            if fallback.is_file() {
-                fallback
+    out
+}
+
+fn cooling_map_dirs(paths: &Paths) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for zone in list_dirs(&paths.cooling_map_root(), "") {
+        out.extend(list_dirs(&zone.join("cooling-maps"), ""));
+    }
+    out
+}
+
+/// `pwm-fan` cooling level table, indexed by cooling state.
+pub fn cooling_levels(of_dir: Option<&Path>, paths: &Paths) -> Vec<u32> {
+    let candidate = match of_dir {
+        Some(dir) => {
+            let direct = dir.join("cooling-levels");
+            if direct.is_file() {
+                Some(direct)
             } else {
-                return None;
+                None
             }
         }
+        None => None,
     };
-    let value = read_be32(&levels, state as usize)?;
-    if value <= 255 {
-        Some(value)
+    let path = candidate.unwrap_or_else(|| paths.pwm_fan_dt().join("cooling-levels"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let mut levels = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= bytes.len() {
+        levels.push(u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]));
+        offset += 4;
+    }
+    levels
+}
+
+/// PWM value the kernel demands for a given cooling state.
+pub fn cooling_level_for_state(of_dir: Option<&Path>, paths: &Paths, state: usize) -> Option<u32> {
+    let level = cooling_levels(of_dir, paths).into_iter().nth(state)?;
+    if level <= PWM_LIMIT {
+        Some(level)
     } else {
         None
     }
 }
 
-/// Computes the kernel-derived PWM safety floor for the current CPU
-/// temperature. `cpu_temp` of `None` (sensor unknown) is handled fail-safe:
-/// whenever the kernel owns or shares the fan, a missing CPU reading yields
-/// the maximum floor.
-pub fn thermal_floor(paths: &Paths, pwm_path: &Path, cpu_temp: Option<i32>) -> ThermalFloor {
-    let mut result = ThermalFloor::default();
-    let Some(dev) = cooling_device_path(&paths.pwm_root) else {
-        return result;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorAssessment {
+    pub floor_pwm: u8,
+    pub thermal_state: u32,
+    pub max_state: u32,
+    pub ownership: Ownership,
+    /// How the floor was derived, for the diagnostics tab.
+    pub basis: String,
+    pub cooling_levels: Vec<u32>,
+    pub map_states: Vec<(u32, i32)>,
+}
+
+impl FloorAssessment {
+    fn empty(ownership: Ownership) -> Self {
+        FloorAssessment {
+            floor_pwm: 0,
+            thermal_state: 0,
+            max_state: 0,
+            ownership,
+            basis: "no pwm device".to_string(),
+            cooling_levels: Vec::new(),
+            map_states: Vec::new(),
+        }
+    }
+}
+
+/// Derive the kernel safety floor, mirroring the shell `set_thermal_floor`.
+pub fn evaluate_floor(paths: &Paths, fan: &FanDevice, cpu_temp: Option<i32>) -> FloorAssessment {
+    let mut assessment = FloorAssessment::empty(Ownership::Unknown);
+    let Some(cooling) = fan.cooling_device.as_ref() else {
+        assessment.basis = "no pwm-fan cooling device; kernel floor unknown".to_string();
+        return assessment;
     };
-    result.max_state = read_trim(&dev.join("max_state"))
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
+    assessment.max_state = cooling.max_state;
 
-    let hwmon_dir = pwm_path.parent().map(|p| p.to_path_buf());
-    let dt_dir = hwmon_dir
+    let of_dir = fan.of_node();
+    let dt_dir = match of_dir.as_ref() {
+        Some(dir) if dir.is_dir() => Some(dir.clone()),
+        _ => {
+            let fallback = paths.pwm_fan_dt();
+            if fallback.is_dir() {
+                Some(fallback)
+            } else {
+                None
+            }
+        }
+    };
+    let fan_phandle = dt_dir
         .as_ref()
-        .and_then(|dir| dir.join("device/of_node").canonicalize().ok())
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| paths.dt_root.join("pwm-fan"));
-    let fan_phandle = read_be32(&dt_dir.join("phandle"), 0);
+        .and_then(|dir| dt_be32(&dir.join("phandle"), 0));
+    assessment.cooling_levels = cooling_levels(of_dir.as_deref(), paths);
 
-    let zones_dir = paths.dt_root.join("thermal-zones");
     let mut maps_examined = false;
     let mut map_found = false;
+    let mut best_state: u32 = 0;
+    let mut matched_maps: Vec<(u32, i32)> = Vec::new();
 
     if let Some(fan_phandle) = fan_phandle {
-        for zone in sorted_children(&zones_dir) {
-            for map in sorted_children(&zone.join("cooling-maps")) {
-                let cooling_device = map.join("cooling-device");
-                let trip_ref_file = map.join("trip");
-                if !cooling_device.is_file() || !trip_ref_file.is_file() {
-                    continue;
-                }
-                let Some(map_phandle) = read_be32(&cooling_device, 0) else {
+        let trips = all_trips(paths);
+        for map in cooling_map_dirs(paths) {
+            let device = map.join("cooling-device");
+            let trip_ref_path = map.join("trip");
+            if !device.is_file() || !trip_ref_path.is_file() {
+                continue;
+            }
+            let Some(map_phandle) = dt_be32(&device, 0) else {
+                continue;
+            };
+            maps_examined = true;
+            if map_phandle != fan_phandle {
+                continue;
+            }
+            map_found = true;
+            let Some(map_state) = dt_be32(&device, 1) else {
+                continue;
+            };
+            let Some(trip_ref) = dt_be32(&trip_ref_path, 0) else {
+                continue;
+            };
+            for (trip_path, trip) in &trips {
+                let Some(trip_phandle) = dt_be32(&trip_path.join("phandle"), 0) else {
                     continue;
                 };
-                maps_examined = true;
-                if map_phandle != fan_phandle {
+                if trip_phandle != trip_ref {
                     continue;
                 }
-                map_found = true;
-                let (Some(map_state), Some(trip_ref)) =
-                    (read_be32(&cooling_device, 1), read_be32(&trip_ref_file, 0))
-                else {
-                    continue;
-                };
-                for trip_zone in sorted_children(&zones_dir) {
-                    for trip in sorted_children(&trip_zone.join("trips")) {
-                        let phandle_file = trip.join("phandle");
-                        let temperature_file = trip.join("temperature");
-                        if !phandle_file.is_file() || !temperature_file.is_file() {
-                            continue;
-                        }
-                        if read_be32(&phandle_file, 0) != Some(trip_ref) {
-                            continue;
-                        }
-                        let Some(raw_threshold) = read_be32(&temperature_file, 0) else {
-                            continue;
-                        };
-                        let raw_hyst = read_be32(&trip.join("hysteresis"), 0).unwrap_or(0);
-                        let threshold = raw_threshold / 1000;
-                        let hyst = raw_hyst / 1000;
-                        if let Some(temp) = cpu_temp {
-                            if temp >= (threshold as i32) - (hyst as i32)
-                                && map_state > result.state
-                            {
-                                result.state = map_state;
-                            }
-                        }
+                let threshold = trip.temp_c.unwrap_or(0);
+                let trigger_at = threshold - trip.hysteresis_c as i32;
+                matched_maps.push((map_state, trigger_at));
+                if let Some(current) = cpu_temp {
+                    if current >= trigger_at && map_state > best_state {
+                        best_state = map_state;
                     }
                 }
             }
         }
     }
 
+    assessment.map_states = matched_maps;
+
     if maps_examined && !map_found {
-        // Exclusive userspace fan policy: keep only the high-temperature
-        // emergency floors (the legacy 40°C active map blocked useful
-        // low-speed control).
-        result.owner = ThermalOwner::Userspace;
+        // Exclusive mode: the fan is not in any cooling map, so only the
+        // high temperature emergency states have to be enforced by us.
+        assessment.ownership = Ownership::Exclusive;
         match cpu_temp {
             None => {
-                result.state = 3;
-                result.floor = 255;
+                assessment.thermal_state = 3;
+                assessment.floor_pwm = 255;
+                assessment.basis =
+                    "exclusive control with no CPU reading: emergency state 3, full output"
+                        .to_string();
             }
-            Some(temp) => {
-                if temp >= 113 {
-                    result.state = 3;
-                } else if temp >= 83 {
-                    result.state = 2;
+            Some(current) => {
+                let mut state = 0u32;
+                if current >= EMERGENCY_STATE_2_C {
+                    state = 2;
                 }
-                if result.state > 0 {
-                    result.floor = cooling_level_for_state(pwm_path, &paths.dt_root, result.state)
-                        .unwrap_or(255);
+                if current >= EMERGENCY_STATE_3_C {
+                    state = 3;
+                }
+                assessment.thermal_state = state;
+                if state > 0 {
+                    assessment.floor_pwm =
+                        cooling_level_for_state(of_dir.as_deref(), paths, state as usize)
+                            .map(|value| value.min(PWM_LIMIT) as u8)
+                            .unwrap_or(255);
+                    assessment.basis = format!(
+                        "exclusive control, CPU at {current} C raised the emergency state to {state}"
+                    );
+                } else {
+                    assessment.basis =
+                        "exclusive control; no kernel cooling map demands an output".to_string();
                 }
             }
         }
-        return result;
+        return assessment;
     }
 
     if map_found {
-        result.owner = ThermalOwner::Shared;
+        assessment.ownership = Ownership::Shared;
     }
-    let Some(temp) = cpu_temp else {
-        result.floor = 255;
-        return result;
+
+    let Some(current) = cpu_temp else {
+        // A shared map plus an unreadable CPU temperature is the one case where
+        // we cannot compute the kernel demand, so assume the maximum.
+        assessment.floor_pwm = 255;
+        assessment.basis =
+            "no CPU reading while the kernel shares fan control: full output".to_string();
+        return assessment;
     };
 
-    // Conservative fallback for old H5000M firmware when the DT provides no
-    // usable map data for the current temperature.
-    if result.state == 0 {
-        if temp >= 38 {
-            result.state = 1;
+    let mut state = best_state;
+    if state == 0 {
+        // Device tree discovery gave no active state; use the thresholds the
+        // older H5000M firmware used so the fan still ramps up.
+        if current >= FALLBACK_STATE_1_C {
+            state = 1;
         }
-        if temp >= 83 {
-            result.state = 2;
+        if current >= EMERGENCY_STATE_2_C {
+            state = 2;
         }
-        if temp >= 113 {
-            result.state = 3;
+        if current >= EMERGENCY_STATE_3_C {
+            state = 3;
+        }
+        if state != 0 {
+            assessment.basis = format!(
+                "conservative fallback thresholds ({FALLBACK_STATE_1_C}/{EMERGENCY_STATE_2_C}/{EMERGENCY_STATE_3_C} C) selected state {state}"
+            );
+        }
+    } else {
+        assessment.basis = format!("kernel cooling maps selected state {state}");
+    }
+    assessment.thermal_state = state;
+    if state == 0 {
+        return assessment;
+    }
+    assessment.floor_pwm = cooling_level_for_state(of_dir.as_deref(), paths, state as usize)
+        .map(|value| value.min(PWM_LIMIT) as u8)
+        .unwrap_or(255);
+    assessment
+}
+
+/// Undo the 2.0.x behaviour of switching the CPU thermal zone to `user_space`.
+///
+/// Returns a description when something was restored. The recorded zone has to
+/// live under the configured sysfs root, so a planted file cannot make us write
+/// to an arbitrary path.
+pub fn restore_legacy_policy(paths: &Paths) -> Option<String> {
+    let file = paths.legacy_policy_file();
+    if !file.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let mut lines = text.lines();
+    let zone = lines.next().unwrap_or_default().trim().to_string();
+    let policy = lines.next().unwrap_or_default().trim().to_string();
+    let mut note = None;
+    if !zone.is_empty() && Path::new(&zone).starts_with(&paths.sysfs) {
+        let policy_path = Path::new(&zone).join("policy");
+        let available =
+            read_trimmed(&Path::new(&zone).join("available_policies")).unwrap_or_default();
+        let mut target = if available.split_whitespace().any(|name| name == policy) {
+            Some(policy.clone())
+        } else if available.split_whitespace().any(|name| name == "step_wise") {
+            Some("step_wise".to_string())
+        } else {
+            None
+        };
+        if target.as_deref().is_some() {
+            // Never hand the zone back to user_space even if that is what was
+            // recorded: the whole point of the restore is to re-enable the
+            // kernel governor.
+            if target.as_deref() == Some("user_space") {
+                target = Some("step_wise".to_string());
+            }
+            if let Some(value) = target.as_ref() {
+                match std::fs::write(&policy_path, format!("{value}\n")) {
+                    Ok(()) => {
+                        note = Some(format!("restored thermal governor {value} on {zone}"));
+                    }
+                    Err(err) => {
+                        note = Some(format!("could not restore the governor on {zone}: {err}"));
+                    }
+                }
+            }
+        } else {
+            note = Some(format!("no usable governor found for {zone}"));
+        }
+    } else if !zone.is_empty() {
+        note = Some(format!("ignored legacy policy record for {zone}"));
+    }
+    let _ = std::fs::remove_file(&file);
+    Some(note.unwrap_or_else(|| "removed the legacy thermal policy record".to_string()))
+}
+
+/// Read the protection state without changing anything.
+pub fn inspect_kernel_protection(
+    paths: &Paths,
+    fan_device: Option<&FanDevice>,
+) -> KernelProtection {
+    let zone = find_cpu_zone(paths);
+    let trips = all_trips(paths).into_iter().map(|(_, trip)| trip).collect();
+    let cooling = fan_device.and_then(|fan| fan.cooling_device.as_ref());
+    let cpufreq_cooling = fan::cpufreq_cooling_device(paths).is_some();
+    let mut protection = KernelProtection {
+        zone,
+        trips,
+        cpufreq_cooling,
+        fan_cooling_device: cooling.map(|device| device.path.display().to_string()),
+        fan_max_state: cooling.map(|device| device.max_state).unwrap_or(0),
+        warnings: Vec::new(),
+    };
+    if !cpufreq_cooling {
+        protection
+            .warnings
+            .push("no cpufreq cooling device is registered".to_string());
+    }
+    match protection.zone.as_ref() {
+        None => protection
+            .warnings
+            .push("no CPU thermal zone could be inspected".to_string()),
+        Some(zone) if zone.governor_is_hijacked() => protection.warnings.push(format!(
+            "thermal zone {} is using the user_space governor; CPU throttling is not being applied",
+            zone.kind
+        )),
+        Some(_) => {
+            if protection.critical_trip().is_none() && protection.hot_trip().is_none() {
+                protection
+                    .warnings
+                    .push("no hot or critical trip is declared in the devicetree".to_string());
+            }
         }
     }
-    if result.state > 0 {
-        result.floor =
-            cooling_level_for_state(pwm_path, &paths.dt_root, result.state).unwrap_or(255);
-    }
-    result
+    protection
 }
 
 #[cfg(test)]
-#[allow(clippy::field_reassign_with_default)] // test fixtures patch a few paths
 mod tests {
     use super::*;
 
-    fn write(path: &Path, content: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
-    }
-
-    fn write_be32(path: &Path, words: &[u32]) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    /// Builds a fake tree: pwm-fan with cooling-levels [0,96,160,235], a
-    /// pwm-fan cooling device, and a cpu thermal zone whose map references
-    /// the fan for trips at 83°C/113°C.
-    fn fixture(tmp: &Path) -> Paths {
-        let _ = std::fs::remove_dir_all(tmp);
-        let mut paths = Paths::default();
-        paths.pwm_root = tmp.join("sys");
-        paths.dt_root = tmp.join("dt");
-        let hwmon = tmp.join("sys/class/hwmon/hwmon0");
-        write(&hwmon.join("name"), "pwmfan\n");
-        write(&hwmon.join("pwm1"), "0\n");
-        let cooler = tmp.join("sys/class/thermal/cooling_device0");
-        write(&cooler.join("type"), "pwm-fan\n");
-        write(&cooler.join("max_state"), "3\n");
-        let fan_node = tmp.join("dt/pwm-fan");
-        write_be32(&fan_node.join("phandle"), &[0x2a]);
-        write_be32(&fan_node.join("cooling-levels"), &[0, 96, 160, 235]);
-        let zone = tmp.join("dt/thermal-zones/cpu-thermal");
-        write_be32(&zone.join("trips/trip-hot/phandle"), &[0x11]);
-        write_be32(&zone.join("trips/trip-hot/temperature"), &[113000]);
-        write_be32(&zone.join("trips/trip-hot/hysteresis"), &[2000]);
-        write_be32(&zone.join("trips/trip-crit/phandle"), &[0x12]);
-        write_be32(&zone.join("trips/trip-crit/temperature"), &[120000]);
-        write_be32(&zone.join("cooling-maps/map0/cooling-device"), &[0x2a, 2]);
-        write_be32(&zone.join("cooling-maps/map0/trip"), &[0x11]);
-        paths
-    }
-
-    fn pwm(paths: &Paths) -> PathBuf {
-        paths.pwm_root.join("class/hwmon/hwmon0/pwm1")
+    fn be32_bytes(values: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out
     }
 
     #[test]
-    fn shared_owner_uses_kernel_map_thresholds() {
-        let tmp = std::env::temp_dir().join("h5fan-floor-shared");
-        let paths = fixture(&tmp);
-        let pwm = pwm(&paths);
-        // 60°C is below every map trip, but the conservative fallback still
-        // pins cooling state 1 (PWM 96) as the floor.
-        let r = thermal_floor(&paths, &pwm, Some(60));
-        assert_eq!(r.owner, ThermalOwner::Shared);
-        assert_eq!(r.state, 1);
-        assert_eq!(r.floor, 96);
-        assert_eq!(r.max_state, 3);
-        // Hysteresis (2°C) pulls the 113°C trip down to 111°C.
-        let r = thermal_floor(&paths, &pwm, Some(111));
-        assert_eq!(r.state, 2);
-        assert_eq!(r.floor, 160);
-        // Missing CPU sensor with shared ownership -> maximum floor.
-        let r = thermal_floor(&paths, &pwm, None);
-        assert_eq!(r.floor, 255);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn devicetree_properties_are_read_big_endian() {
+        let dir = std::env::temp_dir().join(format!("h5fan-dt-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("cooling-levels");
+        std::fs::write(&file, be32_bytes(&[0, 64, 128, 255])).unwrap();
+        assert_eq!(dt_be32(&file, 0), Some(0));
+        assert_eq!(dt_be32(&file, 1), Some(64));
+        assert_eq!(dt_be32(&file, 3), Some(255));
+        assert_eq!(dt_be32(&file, 4), None, "past the end is not a value");
+        let truncated = dir.join("short");
+        std::fs::write(&truncated, [0u8, 0, 1]).unwrap();
+        assert_eq!(dt_be32(&truncated, 0), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn userspace_owner_keeps_emergency_floors_only() {
-        let tmp = std::env::temp_dir().join("h5fan-floor-exclusive");
-        let paths = fixture(&tmp);
-        // Remove the fan from the cooling map -> maps examined, none matched.
-        let map = tmp.join("dt/thermal-zones/cpu-thermal/cooling-maps/map0/cooling-device");
-        write_be32(&map, &[0x99, 2]);
-        let pwm = pwm(&paths);
-        let r = thermal_floor(&paths, &pwm, Some(70));
-        assert_eq!(r.owner, ThermalOwner::Userspace);
-        assert_eq!(r.state, 0);
-        assert_eq!(r.floor, 0);
-        let r = thermal_floor(&paths, &pwm, Some(85));
-        assert_eq!(r.state, 2);
-        assert_eq!(r.floor, 160);
-        let r = thermal_floor(&paths, &pwm, Some(115));
-        assert_eq!(r.state, 3);
-        assert_eq!(r.floor, 235);
-        let r = thermal_floor(&paths, &pwm, None);
-        assert_eq!(r.state, 3);
-        assert_eq!(r.floor, 255);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn cooling_levels_reject_values_above_the_pwm_range() {
+        let dir = std::env::temp_dir().join(format!("h5fan-lvl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("cooling-levels"), be32_bytes(&[0, 300])).unwrap();
+        let paths = Paths::sandbox(dir.join("nonexistent-root"));
+        assert_eq!(cooling_level_for_state(Some(&dir), &paths, 0), Some(0));
+        assert_eq!(cooling_level_for_state(Some(&dir), &paths, 1), None);
+        assert_eq!(cooling_level_for_state(Some(&dir), &paths, 7), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn fallback_thresholds_when_dt_maps_missing() {
-        let tmp = std::env::temp_dir().join("h5fan-floor-fallback");
-        let paths = fixture(&tmp);
-        // Empty the fan phandle so no map is examined.
-        let fan_node = tmp.join("dt/pwm-fan");
-        write_be32(&fan_node.join("phandle"), &[0x01]);
-        let map_dir = tmp.join("dt/thermal-zones/cpu-thermal/cooling-maps/map0");
-        let _ = std::fs::remove_dir_all(&map_dir);
-        let pwm = pwm(&paths);
-        // Owner stays unknown but the conservative 38/83/113 floors apply.
-        let r = thermal_floor(&paths, &pwm, Some(40));
-        assert_eq!(r.owner, ThermalOwner::Unknown);
-        assert_eq!(r.state, 1);
-        assert_eq!(r.floor, 96);
-        let r = thermal_floor(&paths, &pwm, Some(90));
-        assert_eq!(r.state, 2);
-        let r = thermal_floor(&paths, &pwm, Some(120));
-        assert_eq!(r.state, 3);
-        assert_eq!(r.floor, 235);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn ownership_round_trips_with_the_legacy_strings() {
+        assert_eq!(Ownership::Exclusive.as_str(), "userspace");
+        assert_eq!(Ownership::Unknown.as_apply_str(), "userspace-pwm");
+        assert_eq!(Ownership::parse("userspace-pwm"), Ownership::Exclusive);
+        assert_eq!(Ownership::parse("garbage"), Ownership::Unknown);
+        assert!(Ownership::Shared.describes_kernel_protection_active());
+        assert!(!Ownership::Exclusive.describes_kernel_protection_active());
     }
 
     #[test]
-    fn missing_cooling_levels_defaults_to_full_floor() {
-        let tmp = std::env::temp_dir().join("h5fan-floor-nolevels");
-        let paths = fixture(&tmp);
-        std::fs::remove_file(tmp.join("dt/pwm-fan/cooling-levels")).unwrap();
-        let pwm = pwm(&paths);
-        let map = tmp.join("dt/thermal-zones/cpu-thermal/cooling-maps/map0/cooling-device");
-        write_be32(&map, &[0x99, 2]);
-        let r = thermal_floor(&paths, &pwm, Some(90));
-        assert_eq!(r.owner, ThermalOwner::Userspace);
-        assert_eq!(r.state, 2);
-        assert_eq!(r.floor, 255);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn legacy_policy_restores_never_keep_user_space() {
+        let root = std::env::temp_dir().join(format!("h5fan-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::sandbox(&root);
+        let zone = paths.thermal_dir().join("thermal_zone0");
+        std::fs::create_dir_all(&zone).unwrap();
+        std::fs::write(zone.join("available_policies"), "step_wise fair_share\n").unwrap();
+        std::fs::write(zone.join("policy"), "user_space\n").unwrap();
+        std::fs::create_dir_all(&paths.run_dir).unwrap();
+        std::fs::write(
+            paths.legacy_policy_file(),
+            format!("{}\nuser_space\n", zone.display()),
+        )
+        .unwrap();
+        let note = restore_legacy_policy(&paths).expect("a note");
+        assert!(note.contains("step_wise"), "{note}");
+        assert_eq!(
+            read_trimmed(&zone.join("policy")).as_deref(),
+            Some("step_wise")
+        );
+        assert!(
+            !paths.legacy_policy_file().exists(),
+            "record is consumed once"
+        );
+
+        // A record pointing outside the sysfs root is dropped, not written.
+        std::fs::write(paths.legacy_policy_file(), "/etc/shadow\nstep_wise\n").unwrap();
+        let note = restore_legacy_policy(&paths).expect("a note");
+        assert!(note.contains("ignored"), "{note}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn be32_reader_respects_word_index() {
-        let tmp = std::env::temp_dir().join("h5fan-be32");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let file = tmp.join("words");
-        write_be32(&file, &[0x01020304, 0x0a0b0c0d]);
-        assert_eq!(read_be32(&file, 0), Some(0x01020304));
-        assert_eq!(read_be32(&file, 1), Some(0x0a0b0c0d));
-        assert_eq!(read_be32(&file, 2), None);
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn governor_hijack_is_detected_and_reported() {
+        let root = std::env::temp_dir().join(format!("h5fan-hijack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::sandbox(&root);
+        let zone = paths.thermal_dir().join("thermal_zone0");
+        std::fs::create_dir_all(&zone).unwrap();
+        std::fs::write(zone.join("type"), "cpu-thermal\n").unwrap();
+        std::fs::write(zone.join("policy"), "user_space\n").unwrap();
+        std::fs::write(zone.join("available_policies"), "step_wise user_space\n").unwrap();
+        // Trip points live in the devicetree, not under the thermal zone.
+        let trip = paths
+            .cooling_map_root()
+            .join("cpu-thermal")
+            .join("trips")
+            .join("trip-point2");
+        std::fs::create_dir_all(&trip).unwrap();
+        std::fs::write(trip.join("type"), "critical\n").unwrap();
+        std::fs::write(trip.join("temperature"), be32_bytes(&[125000])).unwrap();
+        let protection = inspect_kernel_protection(&paths, None);
+        assert!(protection.zone.as_ref().unwrap().governor_is_hijacked());
+        assert!(
+            protection.critical_trip().is_some(),
+            "the critical trip must be found in the devicetree"
+        );
+        assert!(
+            !protection.protections_intact(),
+            "a user_space governor must be reported as broken protection"
+        );
+        assert!(protection
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("user_space")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
