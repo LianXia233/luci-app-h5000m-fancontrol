@@ -91,7 +91,8 @@ jobs:
 
       - name: No secrets in the repository
         run: |
-          ! grep -rIl 'BEGIN .*PRIVATE KEY' --exclude-dir=.git .
+          # Exclude .github: this workflow file itself contains the pattern.
+          ! grep -rIl 'BEGIN .*PRIVATE KEY' --exclude-dir=.git --exclude-dir=.github .
           test ! -e private-key.pem
 
       - name: Controller binary sources
