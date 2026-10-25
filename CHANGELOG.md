@@ -12,6 +12,7 @@
 - 修复 `src/src/proc.rs` 测试代码使用不稳定特性 `str::as_str()`（`str_as_str`）导致稳定版 clippy 报 E0658 的问题。
 - 修复 CI secrets 检查匹配到工作流自身的 grep 模式导致必然失败的问题（排除 `.github` 目录）。
 - 修复 CI 前端检查在 ubuntu-latest 上因缺少 gettext（`msgfmt: command not found`，退出码 127）而失败的问题：安装 gettext 后再做翻译校验。
+- 修复 SDK 打包失败：luci.mk 以普通子 make 调用 `src/Makefile install` 时不提供 OpenWrt 的 `INSTALL_DIR`/`INSTALL_BIN`（空展开导致 error 127），改为缺失时回退到规范定义；同时修正 `BINARY` 路径缺少 `target/` 前缀的问题——原路径下 `file` 检查会因错误消息里含目标架构字样而被静默绕过。
 - 修复 shellcheck 警告（init.d 的 rc.common 变量、SHA256SUMS 同文件读写）导致的打包检查失败。
 - 补全 .po 头部字段并更新 check-po.js 以支持多行 msgstr。
 
