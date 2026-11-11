@@ -1,5 +1,17 @@
 # Changelog
 
+## CI 维护 (2026-11-12)
+
+> 仅记录流水线配置变更，不对应新的插件版本号。
+
+- `.github/workflows/ci.yml`、`release.yml` 共 8 处 `uses:` 升级：
+  `actions/checkout@v4` → `v7`、`actions/setup-node@v4` → `v7`、
+  `actions/upload-artifact@v4` → `v7`。
+- GitHub 已于 2026-09-23 从托管 runner 移除 Node 20 运行时，仍声明 `node20` 的 action 会被强制跑在 Node 24 上并打印 `Node.js 20 is deprecated` 告警，属于未验证状态；本次按各 action 的 `action.yml` 逐一核对 `runs.using` 后统一升级。
+- **仅改 CI 配置**：项目源码、`node-version` / `python-version` / `go-version` 等工具链版本、产物命名与 Release 流程均未改动。告警指的是 action 自身声明的运行时，不是项目构建所用的 Node 版本。
+  前端冒烟测试与状态契约检查保持不变。
+- 升级后全仓复扫 59 个工作流/Action 文件：`node20` / `node16` / `node12` 引用残留为 0，所有 YAML 均可解析。
+
 ## 3.2.0
 
 - 5G 模组温度接入：守护进程通过 `luci-app-mt5700` 管理器的本地 RPC
